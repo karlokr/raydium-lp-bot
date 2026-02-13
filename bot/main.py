@@ -15,12 +15,15 @@ from bot.analysis.pool_analyzer import PoolAnalyzer
 from bot.trading.position_manager import PositionManager
 from bot.analysis.price_tracker import PriceTracker
 from bot.analysis.pool_quality import PoolQualityAnalyzer
+from bot.analysis.snapshot_tracker import SnapshotTracker
 
 
 class LiquidityBot:
     def __init__(self):
         self.api_client = RaydiumAPIClient()
         self.analyzer = PoolAnalyzer()
+        self.snapshot_tracker = SnapshotTracker(max_snapshots=10)  # ~30 min window at 3-min scans
+        self.analyzer.set_snapshot_tracker(self.snapshot_tracker)
         self.position_manager = PositionManager()
         self.price_tracker = PriceTracker(self.api_client)
 
@@ -199,6 +202,17 @@ class LiquidityBot:
         # Filter by burn percent
         pools = [p for p in pools if p.get('burnPercent', 0) >= config.MIN_BURN_PERCENT]
 
+        # Record snapshots for all qualifying pools (before safety filter)
+        # so the velocity tracker builds history even for pools we haven't entered.
+        for pool in pools:
+            pool_id = pool.get('ammId', pool.get('id', ''))
+            day = pool.get('day', {})
+            volume = day.get('volume', 0) or pool.get('volume24h', 0)
+            tvl = pool.get('tvl', 0) or pool.get('liquidity', 0)
+            price = pool.get('price', 0)
+            if pool_id and tvl > 0:
+                self.snapshot_tracker.record(pool_id, volume, tvl, price)
+
         safe_pools = PoolQualityAnalyzer.get_safe_pools(
             pools,
             check_locks=config.CHECK_TOKEN_SAFETY
@@ -208,9 +222,26 @@ class LiquidityBot:
 
         print(f"  Found {len(pools)} qualifying pools (burn≥{config.MIN_BURN_PERCENT}%)")
         print(f"  Safe pools after quality check: {len(safe_pools)}")
+        print(f"  Snapshot tracker: {self.snapshot_tracker.pool_count()} pools tracked")
         if top_pools:
             best = top_pools[0]
-            print(f"  Top pool: {best['name']} (score: {best['score']:.1f}, burn: {best.get('burnPercent', 0):.0f}%)")
+            # Pool age label
+            open_time = best.get('openTime', 0)
+            age_str = ''
+            if open_time:
+                try:
+                    age_days = (time.time() - int(open_time)) / 86400
+                    if age_days < 1:
+                        age_str = f", age: {age_days * 24:.0f}h"
+                    elif age_days < 30:
+                        age_str = f", age: {age_days:.0f}d"
+                except (ValueError, TypeError):
+                    pass
+            print(f"  Top pool: {best['name']} (score: {best['score']:.1f}, "
+                  f"burn: {best.get('burnPercent', 0):.0f}%, "
+                  f"mom: {best.get('_momentum', 0):.0f}, "
+                  f"fresh: {best.get('_freshness', 0):.0f}, "
+                  f"vel: {best.get('_velocity', 0):.0f}{age_str})")
 
         return top_pools
 
@@ -307,6 +338,8 @@ class LiquidityBot:
         )
         if success:
             self._refresh_balance()
+            # Clean up snapshot history for this pool
+            self.snapshot_tracker.clear_pool(amm_id)
         return success
 
     def check_and_execute_exits(self):
