@@ -1,3 +1,0 @@
-"""
-Raydium Liquidity Pool Bot
-"""
