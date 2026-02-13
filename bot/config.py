@@ -36,6 +36,7 @@ class BotConfig:
 
     # Position Sizing
     MAX_ABSOLUTE_POSITION_SOL: float = 5.0  # Hard cap per position in SOL
+    MIN_POSITION_SOL: float = 0.05  # Minimum position size (below this, fees eat returns)
     MAX_CONCURRENT_POSITIONS: int = 3  # Max active positions
     RESERVE_SOL: float = 0.05  # Fixed SOL reserve for tx fees + ATA rent
 
@@ -44,6 +45,7 @@ class BotConfig:
     TAKE_PROFIT_PERCENT: float = 20.0  # Exit if up 20% (capture bigger swings)
     MAX_HOLD_TIME_HOURS: int = 24  # Force exit after 24 hours
     MAX_IMPERMANENT_LOSS: float = -5.0  # Exit if IL exceeds 5%
+    EXIT_COOLDOWN_SEC: int = 1800  # Don't re-enter a pool for 30 min after exiting at a loss
 
     # Trading Settings
     TRADING_ENABLED: bool = True  # Set to True to enable real transactions

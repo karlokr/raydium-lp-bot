@@ -57,6 +57,7 @@ class LiquidityBot:
         self.last_pool_scan = 0
         self.last_position_check = 0
         self._failed_pools = set()  # Track pools that failed to avoid retrying
+        self._exit_cooldowns: dict = {}  # amm_id -> timestamp of loss exit (cooldown)
 
         sol_price = self.api_client.get_sol_price_usd()
 
@@ -341,6 +342,10 @@ class LiquidityBot:
             self._refresh_balance()
             # Clean up snapshot history for this pool
             self.snapshot_tracker.clear_pool(amm_id)
+            # Cooldown: don't re-enter pools we exited at a loss
+            if reason in ("Stop Loss", "High IL"):
+                self._exit_cooldowns[amm_id] = time.time()
+                print(f"  🕐 Cooldown: {reason} exit — won't re-enter for {config.EXIT_COOLDOWN_SEC // 60} min")
         return success
 
     def check_and_execute_exits(self):
@@ -367,9 +372,27 @@ class LiquidityBot:
 
         active_amm_ids = set(self.position_manager.active_positions.keys())
         failed_amm_ids = getattr(self, '_failed_pools', set())
-        available_pools = [p for p in top_pools if p['ammId'] not in active_amm_ids and p['ammId'] not in failed_amm_ids]
+
+        # Expire old cooldowns and collect active ones
+        now = time.time()
+        expired = [k for k, t in self._exit_cooldowns.items() if now - t > config.EXIT_COOLDOWN_SEC]
+        for k in expired:
+            del self._exit_cooldowns[k]
+        cooldown_ids = set(self._exit_cooldowns.keys())
+
+        available_pools = [
+            p for p in top_pools
+            if p['ammId'] not in active_amm_ids
+            and p['ammId'] not in failed_amm_ids
+            and p['ammId'] not in cooldown_ids
+        ]
 
         if not available_pools:
+            return
+
+        # Don't even try if we can't afford the minimum position size
+        deployable = initial_balance - config.RESERVE_SOL
+        if deployable < config.MIN_POSITION_SOL:
             return
 
         for rank, pool in enumerate(available_pools):
@@ -565,8 +588,10 @@ class LiquidityBot:
                     self.last_pool_scan = current_time
                     self._failed_pools.clear()  # Reset failed pools on new scan
 
-                if top_pools:
-                    self.look_for_new_entries(top_pools)
+                    # Only look for new entries right after a fresh scan —
+                    # don't re-enter stale pool data after mid-cycle exits
+                    if top_pools:
+                        self.look_for_new_entries(top_pools)
 
                 if current_time - self.last_position_check >= config.POSITION_CHECK_INTERVAL_SEC:
                     self.update_positions()

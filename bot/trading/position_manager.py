@@ -177,8 +177,8 @@ class PositionManager:
             num_open_positions=num_open,
         )
 
-        if position_size < 0.01:
-            print(f"✗ Position too small: {position_size:.4f} SOL")
+        if position_size < config.MIN_POSITION_SOL:
+            print(f"✗ Position too small: {position_size:.4f} SOL (min: {config.MIN_POSITION_SOL})")
             return None
 
         # Determine which side of the pool is SOL
