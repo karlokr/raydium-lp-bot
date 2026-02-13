@@ -62,6 +62,8 @@ class RugCheckAPI:
         - warnings: list of warn-level risk descriptions
         - has_freeze_authority: bool (from risks array, not top-level field)
         - has_mint_authority: bool (from risks array, not top-level field)
+        - has_mutable_metadata: bool (token metadata can be changed)
+        - low_lp_providers: bool (very few liquidity providers)
         - top5_holder_pct: float (top 5 holders %)
         - top10_holder_pct: float (top 10 holders %)
         - max_single_holder_pct: float (largest single holder %)
@@ -93,6 +95,8 @@ class RugCheckAPI:
         warnings = []
         has_freeze = False
         has_mint = False
+        has_mutable_metadata = False
+        low_lp_providers = False
 
         for risk in risks:
             level = risk.get('level', '')
@@ -100,10 +104,15 @@ class RugCheckAPI:
             description = risk.get('description', '')
             display = f"{name}: {description}" if description else name
 
-            if 'freeze' in name.lower():
+            name_lower = name.lower()
+            if 'freeze' in name_lower:
                 has_freeze = True
-            if 'mint' in name.lower() and 'authority' in name.lower():
+            if 'mint' in name_lower and 'authority' in name_lower:
                 has_mint = True
+            if 'mutable' in name_lower and 'metadata' in name_lower:
+                has_mutable_metadata = True
+            if 'lp provider' in name_lower or 'lp provid' in name_lower:
+                low_lp_providers = True
 
             if level == 'danger':
                 dangers.append(display)
@@ -137,6 +146,8 @@ class RugCheckAPI:
             'warnings': warnings,
             'has_freeze_authority': has_freeze,
             'has_mint_authority': has_mint,
+            'has_mutable_metadata': has_mutable_metadata,
+            'low_lp_providers': low_lp_providers,
             'top5_holder_pct': top5_pct,
             'top10_holder_pct': top10_pct,
             'max_single_holder_pct': max_single_pct,

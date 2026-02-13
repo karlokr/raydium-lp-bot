@@ -6,10 +6,14 @@ to assess pool quality and filter out risky pools.
 
 Hard-reject criteria (any = pool rejected):
 - Any danger-level RugCheck risk item
-- Top 10 holders own > MAX_TOP10_HOLDER_PERCENT (default 50%)
-- Single holder owns > MAX_SINGLE_HOLDER_PERCENT (default 20%)
-- RugCheck risk score > MAX_RUGCHECK_SCORE (default 60)
+- RugCheck risk score > MAX_RUGCHECK_SCORE (default 50)
 - Token marked as rugged
+- Top 10 holders own > MAX_TOP10_HOLDER_PERCENT (default 45%)
+- Single holder owns > MAX_SINGLE_HOLDER_PERCENT (default 15%)
+- Fewer than MIN_TOKEN_HOLDERS holders (default 100)
+- Token has mutable metadata (owner can change name/symbol)
+- Very few LP providers (liquidity can be pulled)
+- Token has freeze or mint authority
 - LP burn < 50%
 - Low TVL + extreme APR (rug pull pattern)
 """
@@ -120,6 +124,14 @@ class PoolQualityAnalyzer:
                     if rugcheck_result.get('has_mint_authority'):
                         risks.append("Token has mint authority - unlimited supply possible")
 
+                    # --- Hard rejection: mutable metadata ---
+                    if rugcheck_result.get('has_mutable_metadata'):
+                        risks.append("Token has mutable metadata - owner can change name/symbol")
+
+                    # --- Hard rejection: low LP providers ---
+                    if rugcheck_result.get('low_lp_providers'):
+                        risks.append("Very few LP providers - liquidity can be pulled easily")
+
                     # --- Hard rejection: top 10 holder concentration ---
                     top10_pct = rugcheck_result.get('top10_holder_pct', 0)
                     if top10_pct > config.MAX_TOP10_HOLDER_PERCENT:
@@ -142,9 +154,9 @@ class PoolQualityAnalyzer:
 
                     # --- Low total holders = illiquid / early token ---
                     total_holders = rugcheck_result.get('total_holders', 0)
-                    if total_holders < 50:
-                        risks.append(f"Very few holders ({total_holders}) - illiquid token")
-                    elif total_holders < 200:
+                    if total_holders < config.MIN_TOKEN_HOLDERS:
+                        risks.append(f"Very few holders ({total_holders}, min: {config.MIN_TOKEN_HOLDERS}) - illiquid token")
+                    elif total_holders < 500:
                         warnings.append(f"Low holder count ({total_holders})")
 
                 else:
