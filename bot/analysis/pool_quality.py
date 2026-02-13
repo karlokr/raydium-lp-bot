@@ -63,9 +63,9 @@ class PoolQualityAnalyzer:
             warnings.append(f"Moderate LP burn ({burn_percent:.1f}%)")
 
         # --- APR Sanity ---
-        if apr > 200:
-            risks.append(f"Extremely high APR ({apr:.1f}%) - likely unsustainable")
-        elif apr > 100:
+        if apr > 1000:
+            risks.append(f"Extreme APR ({apr:.1f}%) - likely fake/manipulated")
+        elif apr > 200:
             warnings.append(f"Very high APR ({apr:.1f}%) - high volatility expected")
 
         # --- Liquidity Check ---
@@ -78,8 +78,8 @@ class PoolQualityAnalyzer:
             warnings.append(f"Very high volume/TVL ({vol_tvl:.1f}x) - volatile pool")
 
         # --- Rug Pull Pattern ---
-        if tvl < 20_000 and apr > 300:
-            risks.append("Low liquidity + extreme APR = likely rug pull")
+        if tvl < 5_000 and apr > 500:
+            risks.append("Very low liquidity + extreme APR = likely rug pull")
 
         # --- RugCheck Token Safety (STRICT) ---
         rugcheck_result = None
@@ -140,9 +140,9 @@ class PoolQualityAnalyzer:
 
                     # --- Low total holders = illiquid / early token ---
                     total_holders = rugcheck_result.get('total_holders', 0)
-                    if total_holders < 100:
+                    if total_holders < 50:
                         risks.append(f"Very few holders ({total_holders}) - illiquid token")
-                    elif total_holders < 500:
+                    elif total_holders < 200:
                         warnings.append(f"Low holder count ({total_holders})")
 
                 else:
@@ -180,7 +180,7 @@ class PoolQualityAnalyzer:
 
         for pool in pools:
             analysis = analyzer.analyze_pool(pool, check_safety=check_locks)
-            if analysis['is_safe'] and analysis['liquidity_tier'] != 'low':
+            if analysis['is_safe']:
                 safe_pools.append(pool)
 
         return safe_pools

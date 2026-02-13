@@ -40,14 +40,17 @@ class PoolAnalyzer:
         score += vol_score
 
         # 3. Liquidity Depth Score (0-20 points)
-        if tvl >= 1_000_000:
+        # Lower thresholds — small pools are fine if they pass safety
+        if tvl >= 500_000:
             liq_score = 20
         elif tvl >= 100_000:
-            liq_score = 15
+            liq_score = 17
         elif tvl >= 50_000:
+            liq_score = 14
+        elif tvl >= 20_000:
             liq_score = 10
-        elif tvl >= 10_000:
-            liq_score = 5
+        elif tvl >= 5_000:
+            liq_score = 6
         else:
             liq_score = 0
         score += liq_score

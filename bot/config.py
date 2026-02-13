@@ -22,17 +22,17 @@ class BotConfig:
     API_CACHE_TTL: int = 120  # 2 minutes (meme pools change fast)
 
     # Pool Filtering
-    MIN_LIQUIDITY_USD: float = 10_000  # Minimum $10k TVL
+    MIN_LIQUIDITY_USD: float = 5_000  # Minimum $5k TVL (lower = riskier but juicier)
     MIN_VOLUME_TVL_RATIO: float = 0.5  # 24h volume should be >50% of TVL
-    MIN_APR_24H: float = 50.0  # Minimum 50% APR (meme pools typically show 100%+)
-    MIN_BURN_PERCENT: float = 50.0  # Minimum 50% LP tokens burned
+    MIN_APR_24H: float = 100.0  # Minimum 100% APR (demand high yield for the risk)
+    MIN_BURN_PERCENT: float = 30.0  # Minimum 30% LP tokens burned
     REQUIRE_WSOL_PAIRS: bool = True  # Only trade pairs with WSOL
 
     # Token Safety (via RugCheck)
     CHECK_TOKEN_SAFETY: bool = True  # Check token safety via RugCheck
-    MAX_RUGCHECK_SCORE: int = 60  # Max acceptable RugCheck risk score (0-100, lower=safer)
-    MAX_TOP10_HOLDER_PERCENT: float = 50.0  # Reject if top 10 holders own more than this %
-    MAX_SINGLE_HOLDER_PERCENT: float = 20.0  # Reject if any single holder owns more than this %
+    MAX_RUGCHECK_SCORE: int = 75  # Max acceptable RugCheck risk score (0-100, lower=safer)
+    MAX_TOP10_HOLDER_PERCENT: float = 65.0  # Reject if top 10 holders own more than this %
+    MAX_SINGLE_HOLDER_PERCENT: float = 30.0  # Reject if any single holder owns more than this %
 
     # Position Sizing
     MAX_ABSOLUTE_POSITION_SOL: float = 5.0  # Hard cap per position in SOL
@@ -40,10 +40,10 @@ class BotConfig:
     RESERVE_SOL: float = 0.05  # Fixed SOL reserve for tx fees + ATA rent
 
     # Risk Management
-    STOP_LOSS_PERCENT: float = -15.0  # Exit if down 15% (wide enough for meme volatility)
-    TAKE_PROFIT_PERCENT: float = 10.0  # Exit if up 10% (covers ~2-3% slippage drag on exit)
+    STOP_LOSS_PERCENT: float = -25.0  # Exit if down 25% (wide for high-risk meme pools)
+    TAKE_PROFIT_PERCENT: float = 20.0  # Exit if up 20% (capture bigger swings)
     MAX_HOLD_TIME_HOURS: int = 24  # Force exit after 24 hours
-    MAX_IMPERMANENT_LOSS: float = -3.0  # Exit if IL exceeds 3%
+    MAX_IMPERMANENT_LOSS: float = -5.0  # Exit if IL exceeds 5%
 
     # Trading Settings
     TRADING_ENABLED: bool = True  # Set to True to enable real transactions
