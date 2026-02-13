@@ -152,7 +152,8 @@ class RaydiumExecutor:
             if value_sol > 0:
                 return {'valueSol': value_sol, 'priceRatio': price_ratio}
             return {}
-        except Exception:
+        except Exception as e:
+            print(f"  ⚠ lpvalue exception: {e}")
             return {}
 
     def swap_tokens(

@@ -232,6 +232,10 @@ class LiquidityBot:
                 data = self.executor.get_lp_value_sol(amm_id, pos.lp_mint)
                 if data:
                     on_chain_data[amm_id] = data
+            elif not pos.lp_mint:
+                print(f"  ⚠ No lp_mint set for {pos.pool_name}")
+            elif pos.lp_token_amount <= 0:
+                print(f"  ⚠ lp_token_amount is 0 for {pos.pool_name}")
 
         # Update each position — prefer on-chain price, fall back to API
         for amm_id, position in list(self.position_manager.active_positions.items()):

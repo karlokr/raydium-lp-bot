@@ -1003,12 +1003,11 @@ async function getLpValue(poolId, lpMint) {
             return;
         }
         
-        // Read pool reserves + OpenOrders + LP supply
-        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo, lpMintInfo] = await Promise.all([
+        // Read pool reserves + OpenOrders
+        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo] = await Promise.all([
             connection.getAccountInfo(poolKeys.baseVault),
             connection.getAccountInfo(poolKeys.quoteVault),
             connection.getAccountInfo(poolKeys.openOrders),
-            connection.getAccountInfo(poolKeys.lpMint),
         ]);
         
         const baseVault = new BN(SPL_ACCOUNT_LAYOUT.decode(baseVaultInfo.data).amount.toString());
@@ -1021,11 +1020,20 @@ async function getLpValue(poolId, lpMint) {
             ooQuote = new BN(openOrdersInfo.data.readBigUInt64LE(101).toString());
         }
         
-        const baseReserve = baseVault.add(ooBase).sub(poolKeys.baseNeedTakePnl);
-        const quoteReserve = quoteVault.add(ooQuote).sub(poolKeys.quoteNeedTakePnl);
-        const lpSupplyRaw = new BN(lpMintInfo.data.readBigUInt64LE(36).toString());
-        // Circulating LP supply = total minted - protocol's LP reserve
-        const lpSupply = lpSupplyRaw.sub(poolKeys.lpReserve);
+        // Effective reserves = vault + openOrders - needTakePnl
+        // Guard against negative if needTakePnl > vault (stale AMM state)
+        const baseReserveRaw = baseVault.add(ooBase);
+        const quoteReserveRaw = quoteVault.add(ooQuote);
+        const baseReserve = baseReserveRaw.gt(poolKeys.baseNeedTakePnl)
+            ? baseReserveRaw.sub(poolKeys.baseNeedTakePnl) : baseReserveRaw;
+        const quoteReserve = quoteReserveRaw.gt(poolKeys.quoteNeedTakePnl)
+            ? quoteReserveRaw.sub(poolKeys.quoteNeedTakePnl) : quoteReserveRaw;
+        
+        // Use lpReserve from AMM state as the true circulating LP supply.
+        // The raw mint supply is wrong because burned LP tokens reduce it below
+        // the AMM's internal tracking. The AMM program uses lpReserve as the
+        // denominator when computing LP share of reserves.
+        const lpSupply = poolKeys.lpReserve;
         
         if (lpSupply.isZero()) {
             console.log(JSON.stringify({ valueSol: 0, error: 'LP supply is zero' }));
@@ -1039,12 +1047,8 @@ async function getLpValue(poolId, lpMint) {
         const shareQuote = lpBalance.mul(quoteReserve).div(lpSupply);
         
         // Convert to SOL value
-        // If base is WSOL: solValue = shareBase + shareQuote * baseReserve / quoteReserve
-        // If quote is WSOL: solValue = shareQuote + shareBase * quoteReserve / baseReserve
         let valueLamports;
         if (baseIsWsol) {
-            // shareBase is already in SOL lamports
-            // shareQuote in token units: convert via price = baseReserve/quoteReserve
             const quoteInSol = shareQuote.mul(baseReserve).div(quoteReserve);
             valueLamports = shareBase.add(quoteInSol);
         } else {
