@@ -90,36 +90,6 @@ class LiquidityBot:
                 self.available_capital = 1.0
                 print(f"💰 Dry run mode: simulated {self.available_capital:.4f} SOL")
 
-    def _wait_for_balance_change(self, previous_balance: float,
-                                  max_attempts: int = 10, interval: float = 1.5):
-        """Poll RPC until balance changes from previous_balance and stabilizes.
-
-        After on-chain transactions, Solana RPC can return stale getBalance
-        results for several seconds. This method keeps polling until the
-        balance is different from the previous value AND stays the same
-        for two consecutive reads (stable).
-        """
-        if not self.executor or config.DRY_RUN:
-            return
-
-        last_balance = None
-        for attempt in range(max_attempts):
-            time.sleep(interval)
-            new_balance = self.executor.get_balance()
-
-            if abs(new_balance - previous_balance) > 0.0001:
-                # Balance changed — check if it's stable (same as last read)
-                if last_balance is not None and abs(new_balance - last_balance) < 0.0001:
-                    self.available_capital = new_balance
-                    print(f"💰 Wallet balance: {new_balance:.4f} SOL")
-                    return
-                last_balance = new_balance
-            else:
-                last_balance = None  # Still stale, reset stability check
-
-        # Timed out — use whatever we got last
-        self._refresh_balance()
-
     def _recover_leftover_lp_tokens(self):
         """Find any leftover LP tokens from previous runs and convert them back to SOL.
 
@@ -348,15 +318,18 @@ class LiquidityBot:
 
     def look_for_new_entries(self, top_pools: list):
         """Look for new entry opportunities. Pools are already sorted by score (best first).
-        Higher-ranked pools get larger position sizes."""
+        Position sizes are pre-computed from the initial balance so they're equal."""
         self._refresh_balance()
 
         if not self.position_manager.can_open_position(self.available_capital):
             return
 
-        # Snapshot the total wallet balance for reserve calculations
-        # (this stays constant across all entries in this cycle)
-        total_wallet_balance = self.available_capital
+        # Snapshot the total wallet balance — this is the truth for sizing.
+        # RPC getBalance after entries can be inflated (WSOL accounts, ATA rent
+        # that still shows as lamports, etc.), so we track committed capital
+        # ourselves instead of re-querying.
+        initial_balance = self.available_capital
+        committed = 0.0
 
         active_amm_ids = set(self.position_manager.active_positions.keys())
         failed_amm_ids = getattr(self, '_failed_pools', set())
@@ -369,9 +342,10 @@ class LiquidityBot:
             if not self.position_manager.can_open_position(self.available_capital):
                 break
 
-            # Enforce minimum reserve before even trying
-            if self.available_capital <= config.RESERVE_SOL:
-                print(f"⚠ Available capital ({self.available_capital:.4f} SOL) at reserve floor "
+            # Use tracked capital, not RPC balance
+            tracked_capital = initial_balance - committed
+            if tracked_capital <= config.RESERVE_SOL:
+                print(f"⚠ Tracked capital ({tracked_capital:.4f} SOL) at reserve floor "
                       f"({config.RESERVE_SOL:.4f} SOL) — not entering new positions")
                 break
 
@@ -392,10 +366,10 @@ class LiquidityBot:
 
             position = self.position_manager.open_position(
                 pool,
-                self.available_capital,
+                tracked_capital,
                 current_price,
                 sol_price_usd=self.api_client.get_sol_price_usd(),
-                total_wallet_balance=total_wallet_balance,
+                total_wallet_balance=initial_balance,
                 rank=rank,
                 total_ranked=len(available_pools),
             )
@@ -404,7 +378,6 @@ class LiquidityBot:
                 continue
 
             amm_id = pool['ammId']
-            balance_before = self.available_capital
 
             if not config.DRY_RUN and self.executor:
                 # Step 1: Swap half the SOL into the other token
@@ -420,7 +393,7 @@ class LiquidityBot:
                     print(f"✗ Swap failed - removing position, trying next pool")
                     self.position_manager.close_position(amm_id)
                     self._failed_pools.add(amm_id)
-                    self._wait_for_balance_change(balance_before)
+                    self._refresh_balance()
                     continue
 
                 # Brief delay for on-chain state to settle
@@ -437,7 +410,6 @@ class LiquidityBot:
 
                 if not add_result:
                     print(f"✗ Transaction failed - swapping back to SOL")
-                    # Use 0 amount to signal 'sell all' — the bridge will query the actual balance
                     self.executor.swap_tokens(
                         pool_id=amm_id,
                         amount_in=0,  # sell all available
@@ -445,7 +417,7 @@ class LiquidityBot:
                     )
                     self.position_manager.close_position(amm_id)
                     self._failed_pools.add(amm_id)
-                    self._wait_for_balance_change(balance_before)
+                    self._refresh_balance()
                     continue
 
                 position.pool_data['entry_signature'] = add_result['signature']
@@ -457,14 +429,14 @@ class LiquidityBot:
                     import time as _time
                     _time.sleep(1)
                     lp_raw = self.executor.get_token_balance(lp_mint)
-                    # LP decimals typically match base decimals
                     lp_decimals = pool.get('lpDecimals', 9)
                     position.lp_decimals = lp_decimals
                     position.lp_token_amount = lp_raw / (10 ** lp_decimals)
                     print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
 
-            # Wait for balance to reflect the transaction before sizing the next position
-            self._wait_for_balance_change(balance_before)
+            # Track committed capital ourselves — don't trust RPC balance
+            committed += position.position_size_sol
+            self._refresh_balance()
 
     @staticmethod
     def _usd(sol_amount: float, sol_price: float) -> str:
