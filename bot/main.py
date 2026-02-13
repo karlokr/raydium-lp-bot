@@ -465,14 +465,39 @@ class LiquidityBot:
         if self.position_manager.active_positions:
             print(f"\nActive Positions:")
             for amm_id, pos in self.position_manager.active_positions.items():
+                # Price direction arrow
+                price_chg = pos.price_change_percent
+                price_arrow = "↑" if price_chg > 0.5 else "↓" if price_chg < -0.5 else "→"
+
+                # P&L indicator
+                pnl_pct = pos.pnl_percent
+                pnl_icon = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < -0.5 else "⚪"
+
+                # Time info
+                hours_held = pos.time_held_hours
+                time_left = max(0, config.MAX_HOLD_TIME_HOURS - hours_held)
+                time_str = f"{hours_held:.1f}h" if hours_held < 1 else f"{hours_held:.0f}h"
+                time_left_str = f"{time_left:.0f}h left" if time_left >= 1 else f"{time_left * 60:.0f}m left"
+
+                # Format values
+                entry_str = self._usd(pos.position_size_sol, sol_price)
+                value_str = self._usd(pos.current_lp_value_sol, sol_price) if pos.current_lp_value_sol > 0 else "—"
                 pnl_usd = f" (${pos.unrealized_pnl_sol * sol_price:.2f})" if sol_price > 0 else ""
-                size_str = self._usd(pos.position_size_sol, sol_price)
-                lp_val_str = ""
-                if pos.current_lp_value_sol > 0:
-                    lp_val_str = f" | Value: {self._usd(pos.current_lp_value_sol, sol_price)}"
-                print(f"  • {pos.pool_name}")
-                print(f"    Size: {size_str} | Time: {pos.time_held_hours:.1f}h | IL: {pos.current_il_percent:.2f}% | "
-                      f"P&L: {pos.unrealized_pnl_sol:.4f} SOL{pnl_usd} ({pos.pnl_percent:.2f}%){lp_val_str}")
+
+                # Exit threshold proximity — show nearest trigger
+                exit_warnings = []
+                if pnl_pct <= config.STOP_LOSS_PERCENT + 1.0:
+                    exit_warnings.append(f"SL {config.STOP_LOSS_PERCENT:.0f}%")
+                if pnl_pct >= config.TAKE_PROFIT_PERCENT - 1.5:
+                    exit_warnings.append(f"TP {config.TAKE_PROFIT_PERCENT:.0f}%")
+                if pos.current_il_percent <= config.MAX_IMPERMANENT_LOSS + 1.0:
+                    exit_warnings.append(f"IL lim {config.MAX_IMPERMANENT_LOSS:.0f}%")
+                if time_left < 2:
+                    exit_warnings.append("time lim")
+                exit_str = f" ⚠ Near: {', '.join(exit_warnings)}" if exit_warnings else ""
+
+                print(f"  {pnl_icon} {pos.pool_name}  {price_arrow} {price_chg:+.1f}%  |  {time_str} ({time_left_str})")
+                print(f"    Entry: {entry_str}  →  Value: {value_str}  |  P&L: {pos.unrealized_pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)  |  IL: {pos.current_il_percent:.2f}%{exit_str}")
 
         print(f"{'─' * 60}\n")
 

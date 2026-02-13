@@ -62,6 +62,13 @@ class Position:
         return delta.total_seconds() / 3600
 
     @property
+    def price_change_percent(self) -> float:
+        """Percentage change in token price ratio since entry."""
+        if self.entry_price_ratio <= 0:
+            return 0.0
+        return ((self.current_price_ratio - self.entry_price_ratio) / self.entry_price_ratio) * 100
+
+    @property
     def pnl_percent(self) -> float:
         if self.position_size_sol <= 0:
             return 0.0
