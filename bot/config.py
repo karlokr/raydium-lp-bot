@@ -31,7 +31,7 @@ class BotConfig:
     # Token Safety (via RugCheck)
     CHECK_TOKEN_SAFETY: bool = True  # Check token safety via RugCheck
     MAX_RUGCHECK_SCORE: int = 50  # Max acceptable RugCheck risk score (0-100, lower=safer; >40 = "high risk")
-    MAX_TOP10_HOLDER_PERCENT: float = 45.0  # Reject if top 10 holders own more than this %
+    MAX_TOP10_HOLDER_PERCENT: float = 35.0  # Reject if top 10 holders own more than this %
     MAX_SINGLE_HOLDER_PERCENT: float = 15.0  # Reject if any single holder owns more than this %
     MIN_TOKEN_HOLDERS: int = 100  # Reject tokens with fewer holders (thin markets = easy to manipulate)
 
