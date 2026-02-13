@@ -114,13 +114,15 @@ class PoolAnalyzer:
 
         Position sizing rules:
         1. A reserve is always kept: max(balance * RESERVE_PERCENT, MIN_RESERVE_SOL)
-        2. The best-ranked pool (rank=0) gets the largest allocation.
-           With 1 position slot, it gets POSITION_SIZE_PERCENT of deployable capital.
-        3. With multiple slots, higher-ranked pools get proportionally more
-           (descending weight: rank 0 biggest, rank N-1 smallest).
+        2. The deployable capital is split across ALL remaining slots at once
+           using descending weights so the best-ranked pool (rank=0 among
+           remaining slots) gets the largest share.
+        3. Weights: slot 0 gets `slots` shares, slot 1 gets `slots-1`, etc.
+           E.g. with 3 slots: weights 3,2,1 → 50%, 33%, 17%.
         4. Never exceed MAX_ABSOLUTE_POSITION_SOL.
         """
-        positions_remaining = config.MAX_CONCURRENT_POSITIONS - num_open_positions
+        max_positions = config.MAX_CONCURRENT_POSITIONS
+        positions_remaining = max_positions - num_open_positions
         if positions_remaining <= 0:
             return 0.0
 
@@ -140,18 +142,23 @@ class PoolAnalyzer:
             return 0.0
 
         # Position sizing by slot count
-        if config.MAX_CONCURRENT_POSITIONS == 1:
+        if max_positions == 1:
             # Single-position mode: use POSITION_SIZE_PERCENT (e.g. 80%)
-            alloc_percent = config.POSITION_SIZE_PERCENT
+            size = deployable * config.POSITION_SIZE_PERCENT
         else:
-            # Multiple positions: split evenly across remaining slots
-            # Each position gets an equal share of deployable capital
-            alloc_percent = 1.0 / positions_remaining
+            # Multiple positions: descending weights by rank.
+            # The slot index within remaining slots determines weight.
+            # slot_index = rank (0 = best among candidates still to enter)
+            slot_index = min(rank, positions_remaining - 1)
 
-        size = min(
-            deployable * alloc_percent,
-            config.MAX_ABSOLUTE_POSITION_SOL,
-        )
+            # Weights: first slot gets `positions_remaining` shares,
+            # second gets `positions_remaining - 1`, etc.
+            # Total weight = sum(1..positions_remaining) = n*(n+1)/2
+            weight = positions_remaining - slot_index
+            total_weight = positions_remaining * (positions_remaining + 1) / 2
+            size = deployable * (weight / total_weight)
+
+        size = min(size, config.MAX_ABSOLUTE_POSITION_SOL)
 
         return size
 
