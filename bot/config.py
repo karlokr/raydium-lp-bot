@@ -42,8 +42,8 @@ class BotConfig:
     POSITION_SIZE_PERCENT: float = 0.80  # Use 80% of deployable capital for best-ranked pool
 
     # Risk Management
-    STOP_LOSS_PERCENT: float = -2.0  # Exit if down 2% (after fees/IL)
-    TAKE_PROFIT_PERCENT: float = 5.0  # Exit if up 5% (after fees/IL)
+    STOP_LOSS_PERCENT: float = -4.0  # Exit if down 4% (after fees/IL)
+    TAKE_PROFIT_PERCENT: float = 6.0  # Exit if up 6% (after fees/IL)
     MAX_HOLD_TIME_HOURS: int = 24  # Force exit after 24 hours
     MAX_IMPERMANENT_LOSS: float = -3.0  # Exit if IL exceeds 3%
 
