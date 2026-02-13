@@ -175,9 +175,6 @@ class PositionManager:
             pool,
             available_capital,
             num_open_positions=num_open,
-            total_wallet_balance=total_wallet_balance,
-            rank=rank,
-            total_ranked=total_ranked,
         )
 
         if position_size < 0.01:

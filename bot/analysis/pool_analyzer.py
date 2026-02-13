@@ -105,58 +105,36 @@ class PoolAnalyzer:
         pool: Dict,
         available_capital: float,
         num_open_positions: int = 0,
-        total_wallet_balance: float = 0.0,
-        rank: int = 0,
-        total_ranked: int = 1,
     ) -> float:
         """
         Calculate optimal position size in SOL.
 
-        Position sizing rules:
-        1. A reserve is always kept: max(balance * RESERVE_PERCENT, MIN_RESERVE_SOL)
-        2. The deployable capital is split across ALL remaining slots at once
-           using descending weights so the best-ranked pool (rank=0 among
-           remaining slots) gets the largest share.
-        3. Weights: slot 0 gets `slots` shares, slot 1 gets `slots-1`, etc.
-           E.g. with 3 slots: weights 3,2,1 → 50%, 33%, 17%.
-        4. Never exceed MAX_ABSOLUTE_POSITION_SOL.
+        Simple and robust: split available capital evenly across remaining
+        slots, after keeping a reserve. Higher-ranked pools naturally get
+        larger positions because they enter first when capital is highest.
+
+        Rules:
+        1. Reserve = max(available * RESERVE_PERCENT, MIN_RESERVE_SOL) + ATA rent
+        2. Size = deployable / positions_remaining
+        3. Never exceed MAX_ABSOLUTE_POSITION_SOL
         """
-        max_positions = config.MAX_CONCURRENT_POSITIONS
-        positions_remaining = max_positions - num_open_positions
+        positions_remaining = config.MAX_CONCURRENT_POSITIONS - num_open_positions
         if positions_remaining <= 0:
             return 0.0
 
-        # Use total_wallet_balance to compute reserve (if provided)
-        reference_balance = total_wallet_balance if total_wallet_balance > 0 else available_capital
-
-        # Reserve: the larger of percentage-based or absolute minimum
+        # Reserve: always keep enough for tx fees + future operations
         reserve = max(
-            reference_balance * config.RESERVE_PERCENT,
+            available_capital * config.RESERVE_PERCENT,
             config.MIN_RESERVE_SOL,
         )
-        # Also keep ATA rent aside
         reserve += self.ATA_RENT_RESERVE_SOL
 
         deployable = available_capital - reserve
         if deployable <= 0:
             return 0.0
 
-        # Position sizing by slot count
-        if max_positions == 1:
-            # Single-position mode: use POSITION_SIZE_PERCENT (e.g. 80%)
-            size = deployable * config.POSITION_SIZE_PERCENT
-        else:
-            # Multiple positions: descending weights by rank.
-            # The slot index within remaining slots determines weight.
-            # slot_index = rank (0 = best among candidates still to enter)
-            slot_index = min(rank, positions_remaining - 1)
-
-            # Weights: first slot gets `positions_remaining` shares,
-            # second gets `positions_remaining - 1`, etc.
-            # Total weight = sum(1..positions_remaining) = n*(n+1)/2
-            weight = positions_remaining - slot_index
-            total_weight = positions_remaining * (positions_remaining + 1) / 2
-            size = deployable * (weight / total_weight)
+        # Equal split across remaining slots
+        size = deployable / positions_remaining
 
         size = min(size, config.MAX_ABSOLUTE_POSITION_SOL)
 

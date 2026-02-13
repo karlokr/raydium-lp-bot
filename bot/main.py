@@ -341,7 +341,7 @@ class LiquidityBot:
 
             # Enforce absolute minimum reserve before even trying
             reserve_floor = max(
-                total_wallet_balance * config.RESERVE_PERCENT,
+                self.available_capital * config.RESERVE_PERCENT,
                 config.MIN_RESERVE_SOL,
             )
             if self.available_capital <= reserve_floor:
