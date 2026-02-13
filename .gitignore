@@ -37,6 +37,9 @@ yarn-error.log*
 *.log
 logs/
 
+# Bot state data (positions, trade history)
+data/
+
 # OS
 .DS_Store
 Thumbs.db

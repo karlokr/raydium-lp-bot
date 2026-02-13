@@ -16,6 +16,7 @@ from bot.trading.position_manager import PositionManager
 from bot.analysis.price_tracker import PriceTracker
 from bot.analysis.pool_quality import PoolQualityAnalyzer
 from bot.analysis.snapshot_tracker import SnapshotTracker
+from bot import state
 
 
 class LiquidityBot:
@@ -34,6 +35,19 @@ class LiquidityBot:
             print(f"⚠️  Could not initialize executor: {e}")
             self.executor = None
 
+        # State (initialize before anything reads it)
+        self.running = False
+        self._shutting_down = False
+        self.last_pool_scan = 0
+        self.last_position_check = 0
+        self._failed_pools = set()  # Track pools that failed to avoid retrying
+        self._exit_cooldowns: dict = {}  # amm_id -> timestamp of loss exit (cooldown)
+        self._last_scan_pools: list = []  # Top-ranked pools from last scan
+
+        # Restore state from disk FIRST — positions must be known
+        # before LP recovery so we don't accidentally exit them
+        self._load_saved_state()
+
         # Unwrap any WSOL to native SOL at startup
         # (the SDK uses native SOL for all operations)
         if self.executor and not config.DRY_RUN:
@@ -45,19 +59,12 @@ class LiquidityBot:
                     print(f"✓ Unwrapped {unwrapped:.4f} WSOL → native SOL")
 
             # Recover any leftover LP tokens from previous runs
+            # (skips LP mints belonging to restored positions)
             self._recover_leftover_lp_tokens()
 
         # Capital is always the current wallet balance
         self.available_capital = 0.0  # in SOL
         self._refresh_balance()
-
-        # State
-        self.running = False
-        self._shutting_down = False
-        self.last_pool_scan = 0
-        self.last_position_check = 0
-        self._failed_pools = set()  # Track pools that failed to avoid retrying
-        self._exit_cooldowns: dict = {}  # amm_id -> timestamp of loss exit (cooldown)
 
         sol_price = self.api_client.get_sol_price_usd()
 
@@ -94,8 +101,62 @@ class LiquidityBot:
                 self.available_capital = 1.0
                 print(f"💰 Dry run mode: simulated {self.available_capital:.4f} SOL")
 
+    def _load_saved_state(self):
+        """Restore bot state from disk if available."""
+        saved = state.load_state()
+        if not saved:
+            return
+
+        age_sec = time.time() - saved.get('saved_timestamp', 0)
+        age_str = f"{age_sec / 60:.0f} min" if age_sec < 3600 else f"{age_sec / 3600:.1f}h"
+        print(f"\n📂 Loaded saved state from {saved['saved_at']} ({age_str} ago)")
+
+        # Restore active positions
+        restored_positions = saved.get('positions', {})
+        if restored_positions:
+            self.position_manager.active_positions = restored_positions
+            names = [p.pool_name for p in restored_positions.values()]
+            print(f"  ✓ Restored {len(restored_positions)} active position(s): {', '.join(names)}")
+
+        # Restore exit cooldowns (skip expired ones)
+        now = time.time()
+        cooldowns = saved.get('exit_cooldowns', {})
+        self._exit_cooldowns = {
+            k: v for k, v in cooldowns.items()
+            if now - v < config.EXIT_COOLDOWN_SEC
+        }
+        if self._exit_cooldowns:
+            print(f"  ✓ Restored {len(self._exit_cooldowns)} exit cooldown(s)")
+
+        # Restore failed pools
+        self._failed_pools = saved.get('failed_pools', set())
+
+        # Restore snapshot tracker history
+        snapshot_data = saved.get('snapshots', {})
+        if snapshot_data:
+            state.snapshots_from_dict(self.snapshot_tracker, snapshot_data)
+            print(f"  ✓ Restored snapshot history for {len(snapshot_data)} pool(s)")
+
+        # Restore last scan results
+        self._last_scan_pools = saved.get('last_scan_pools', [])
+        if self._last_scan_pools:
+            print(f"  ✓ Restored {len(self._last_scan_pools)} ranked pools from last scan")
+
+    def _save_state(self):
+        """Persist current bot state to disk."""
+        state.save_state(
+            positions=self.position_manager.active_positions,
+            exit_cooldowns=self._exit_cooldowns,
+            failed_pools=self._failed_pools,
+            snapshot_tracker=self.snapshot_tracker,
+            last_scan_pools=self._last_scan_pools,
+        )
+
     def _recover_leftover_lp_tokens(self):
         """Find any leftover LP tokens from previous runs and convert them back to SOL.
+
+        Skips LP mints belonging to active (restored) positions — those are
+        intentionally held and will be managed by the normal exit logic.
 
         Uses the same proven recovery flow as recover.py:
           1. List all token accounts in the wallet
@@ -104,6 +165,12 @@ class LiquidityBot:
         """
         if not self.executor:
             return
+
+        # Collect LP mints that belong to restored positions — skip them
+        known_lp_mints = set()
+        for pos in self.position_manager.active_positions.values():
+            if pos.lp_mint:
+                known_lp_mints.add(pos.lp_mint)
 
         # Step 1: Get all non-zero token accounts
         all_tokens = self.executor.list_all_tokens()
@@ -149,6 +216,16 @@ class LiquidityBot:
 
         if not lp_positions:
             return
+
+        # Filter out LP mints belonging to restored positions
+        if known_lp_mints:
+            before = len(lp_positions)
+            lp_positions = [p for p in lp_positions if p['lp_mint'] not in known_lp_mints]
+            skipped = before - len(lp_positions)
+            if skipped:
+                print(f"  ℹ Skipping {skipped} LP token(s) belonging to restored positions")
+            if not lp_positions:
+                return
 
         # Step 3: Recover each LP position (same flow as recover.py)
         print(f"\n{'=' * 60}")
@@ -245,6 +322,10 @@ class LiquidityBot:
                   f"fresh: {best.get('_freshness', 0):.0f}, "
                   f"vel: {best.get('_velocity', 0):.0f}{age_str})")
 
+        # Persist scan results to disk
+        self._last_scan_pools = top_pools
+        self._save_state()
+
         return top_pools
 
     def update_positions(self):
@@ -335,8 +416,14 @@ class LiquidityBot:
                 direction='sell',
             )
 
+        sol_price = self.api_client.get_sol_price_usd()
+
+        # Record trade history before closing (position is deleted on close)
+        if position:
+            state.append_trade_history(position, reason, sol_price_usd=sol_price)
+
         success = self.position_manager.close_position(
-            amm_id, reason, sol_price_usd=self.api_client.get_sol_price_usd()
+            amm_id, reason, sol_price_usd=sol_price
         )
         if success:
             self._refresh_balance()
@@ -346,6 +433,8 @@ class LiquidityBot:
             if reason in ("Stop Loss", "High IL"):
                 self._exit_cooldowns[amm_id] = time.time()
                 print(f"  🕐 Cooldown: {reason} exit — won't re-enter for {config.EXIT_COOLDOWN_SEC // 60} min")
+            # Persist state after exit
+            self._save_state()
         return success
 
     def check_and_execute_exits(self):
@@ -494,6 +583,7 @@ class LiquidityBot:
             # Track committed capital ourselves — don't trust RPC balance
             committed += position.position_size_sol
             self._refresh_balance()
+            self._save_state()
 
     @staticmethod
     def _usd(sol_amount: float, sol_price: float) -> str:
@@ -608,36 +698,28 @@ class LiquidityBot:
             self.shutdown()
 
     def shutdown(self):
-        """Graceful shutdown — exit ALL positions on-chain."""
+        """Graceful shutdown — save state and stop. Positions stay open on-chain
+        and will be resumed on the next run."""
         if self._shutting_down:
             print("\n⚠ Already shutting down... please wait")
             return
         self._shutting_down = True
 
-        # Prevent further Ctrl+C from interrupting exits
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
         print("\nShutting down bot...")
         self.running = False
 
-        positions = list(self.position_manager.active_positions.keys())
-        if positions:
-            print(f"\n⚠ Exiting {len(positions)} active position(s)...")
-            for amm_id in positions:
-                pos = self.position_manager.active_positions.get(amm_id)
-                name = pos.pool_name if pos else amm_id[:8]
-                print(f"\n{'─' * 40}")
-                print(f"Exiting: {name}")
-                try:
-                    self._exit_position(amm_id, "Shutdown")
-                except Exception as e:
-                    print(f"✗ Error exiting {name}: {e}")
-                    # Still remove from tracking even if on-chain exit fails
-                    self.position_manager.close_position(
-                        amm_id, f"Shutdown (error: {e})",
-                        sol_price_usd=self.api_client.get_sol_price_usd()
-                    )
+        # Save state — positions persist on-chain and will be resumed next run
+        n = len(self.position_manager.active_positions)
+        if n > 0:
+            self._save_state()
+            names = [p.pool_name for p in self.position_manager.active_positions.values()]
+            print(f"\n💾 Saved {n} active position(s) to disk: {', '.join(names)}")
+            print(f"   Positions remain open on-chain — will resume on next run")
+        else:
+            state.clear_state()
 
         self.print_status()
         print("✓ Bot stopped")
