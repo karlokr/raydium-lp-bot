@@ -165,6 +165,11 @@ class RaydiumAPIClient:
                         break
 
                     for pool in pools:
+                        # Only Raydium V4 AMM pools are supported by our bridge.
+                        # CPMM (CPMMoo8L...) and CLMM pools have different layouts.
+                        pool_program = pool.get('programId', '')
+                        if pool_program and pool_program != '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8':
+                            continue
                         normalized = self._normalize_pool(pool)
                         pool_id = normalized.get('ammId', '')
                         if pool_id and pool_id not in seen_ids:

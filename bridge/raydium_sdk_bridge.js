@@ -33,6 +33,7 @@ const {
 } = RaydiumSDK;
 
 const WSOL_MINT = new PublicKey('So11111111111111111111111111111111111111112');
+const RAYDIUM_V4_PROGRAM = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
 
 // Load environment variables
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -104,6 +105,13 @@ async function fetchPoolKeys(poolId) {
     
     const ammProgramId = ammAccountInfo.owner;
     console.error('AMM program owner: ' + ammProgramId.toString());
+    
+    // Only Raydium V4 AMM is supported. CPMM (CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C)
+    // and CLMM pools have completely different binary layouts and will produce
+    // garbage data if decoded with LIQUIDITY_STATE_LAYOUT_V4.
+    if (!ammProgramId.equals(RAYDIUM_V4_PROGRAM)) {
+        throw new Error('Unsupported pool program: ' + ammProgramId.toString() + '. Only Raydium V4 AMM (675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8) is supported.');
+    }
     
     // Decode AMM state using the SDK layout
     const ammState = LIQUIDITY_STATE_LAYOUT_V4.decode(ammAccountInfo.data);
@@ -196,10 +204,20 @@ async function getOwnerTokenAccounts() {
     
     const accounts = [];
     for (const { pubkey, account } of tokenResp.value) {
+        // Build a minimal accountInfo object using raw buffer reads to avoid
+        // SPL_ACCOUNT_LAYOUT.decode() which can throw "53 bits" on large amounts.
+        // SPL Token account layout:
+        //   offset 0:  mint (32 bytes, PublicKey)
+        //   offset 32: owner (32 bytes, PublicKey)
+        //   offset 64: amount (8 bytes, u64 LE)
+        const data = account.data;
+        const mint = new PublicKey(data.subarray(0, 32));
+        const owner = new PublicKey(data.subarray(32, 64));
+        const amount = new BN(data.readBigUInt64LE(64).toString());
         accounts.push({
             pubkey,
             programId: TOKEN_PROGRAM_ID,
-            accountInfo: SPL_ACCOUNT_LAYOUT.decode(account.data),
+            accountInfo: { mint, owner, amount },
         });
     }
     
@@ -264,8 +282,8 @@ async function addLiquidity(poolId, amountA, amountB, slippage) {
         if (!nonSolAcctInfo) {
             throw new Error('Non-SOL token account not found. Did the swap succeed?');
         }
-        const nonSolDecoded = SPL_ACCOUNT_LAYOUT.decode(nonSolAcctInfo.data);
-        const actualNonSolRaw = new BN(nonSolDecoded.amount.toString());
+        // Read amount from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+        const actualNonSolRaw = new BN(nonSolAcctInfo.data.readBigUInt64LE(64).toString());
         const actualNonSol = parseFloat(new Decimal(actualNonSolRaw.toString()).div(new Decimal(10).pow(nonSolDecimals)).toString());
         
         console.error('Actual non-SOL token balance: ' + actualNonSol + ' (raw: ' + actualNonSolRaw.toString() + ')');
@@ -282,8 +300,9 @@ async function addLiquidity(poolId, amountA, amountB, slippage) {
         if (!baseVaultInfo || !quoteVaultInfo) {
             throw new Error('Could not read pool vault accounts');
         }
-        const baseVaultAmount = new BN(SPL_ACCOUNT_LAYOUT.decode(baseVaultInfo.data).amount.toString());
-        const quoteVaultAmount = new BN(SPL_ACCOUNT_LAYOUT.decode(quoteVaultInfo.data).amount.toString());
+        // Read amounts from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+        const baseVaultAmount = new BN(baseVaultInfo.data.readBigUInt64LE(64).toString());
+        const quoteVaultAmount = new BN(quoteVaultInfo.data.readBigUInt64LE(64).toString());
         console.error('Vault balances - base: ' + baseVaultAmount.toString() + ', quote: ' + quoteVaultAmount.toString());
         
         // Read OpenOrders totals (Serum V3 layout: baseTokenTotal at offset 85, quoteTokenTotal at offset 101, both u64 LE)
@@ -381,8 +400,7 @@ async function addLiquidity(poolId, amountA, amountB, slippage) {
         if (nativeBal < totalNeeded) {
             const wsolAcctInfo = await connection.getAccountInfo(wsolAta);
             if (wsolAcctInfo) {
-                const decoded = SPL_ACCOUNT_LAYOUT.decode(wsolAcctInfo.data);
-                const wsolBalance = BigInt(decoded.amount.toString());
+                const wsolBalance = wsolAcctInfo.data.readBigUInt64LE(64);
                 console.error('Unwrapping WSOL ATA (' + wsolBalance.toString() + ' lamports) to get native SOL...');
                 const unwrapTx = new Transaction();
                 unwrapTx.add(createCloseAccountInstruction(wsolAta, wallet.publicKey, wallet.publicKey));
@@ -470,8 +488,8 @@ async function removeLiquidity(poolId, lpAmount, slippage) {
         if (!lpAccountInfo) {
             throw new Error('No LP token account found for mint ' + poolKeys.lpMint.toBase58());
         }
-        const decoded = SPL_ACCOUNT_LAYOUT.decode(lpAccountInfo.data);
-        const rawAmount = new BN(decoded.amount.toString());
+        // Read amount from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+        const rawAmount = new BN(lpAccountInfo.data.readBigUInt64LE(64).toString());
         if (rawAmount.isZero()) {
             throw new Error('LP token balance is 0');
         }
@@ -543,9 +561,8 @@ async function getBalance(tokenMint) {
             return;
         }
         
-        const decoded = SPL_ACCOUNT_LAYOUT.decode(accountInfo.data);
-        // decoded.amount is already a BN from the layout decoder
-        const balance = decoded.amount.toString();
+        // Read amount from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+        const balance = accountInfo.data.readBigUInt64LE(64).toString();
         
         console.log(JSON.stringify({ balance }));
         
@@ -977,8 +994,8 @@ async function unwrapWsol() {
             console.log(JSON.stringify({ success: true, unwrapped: 0, note: 'No WSOL ATA found' }));
             return;
         }
-        const decoded = SPL_ACCOUNT_LAYOUT.decode(acctInfo.data);
-        const balance = BigInt(decoded.amount.toString());
+        // Read amount from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+        const balance = acctInfo.data.readBigUInt64LE(64);
         // Closing the ATA returns the token balance + rent to the owner as native SOL
         const tx = new Transaction();
         tx.add(createCloseAccountInstruction(wsolAta, wallet.publicKey, wallet.publicKey));
@@ -1020,8 +1037,8 @@ async function getLpValue(poolId, lpMint) {
             console.log(JSON.stringify({ valueSol: 0, lpBalance: 0 }));
             return;
         }
-        const lpDecoded = SPL_ACCOUNT_LAYOUT.decode(lpAcctInfo.data);
-        const lpBalance = new BN(lpDecoded.amount.toString());
+        // Read amount from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+        const lpBalance = new BN(lpAcctInfo.data.readBigUInt64LE(64).toString());
         
         if (lpBalance.isZero()) {
             console.log(JSON.stringify({ valueSol: 0, lpBalance: 0 }));
@@ -1035,8 +1052,9 @@ async function getLpValue(poolId, lpMint) {
             connection.getAccountInfo(poolKeys.openOrders),
         ]);
         
-        const baseVault = new BN(SPL_ACCOUNT_LAYOUT.decode(baseVaultInfo.data).amount.toString());
-        const quoteVault = new BN(SPL_ACCOUNT_LAYOUT.decode(quoteVaultInfo.data).amount.toString());
+        // Read amounts from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+        const baseVault = new BN(baseVaultInfo.data.readBigUInt64LE(64).toString());
+        const quoteVault = new BN(quoteVaultInfo.data.readBigUInt64LE(64).toString());
         
         let ooBase = new BN(0);
         let ooQuote = new BN(0);
