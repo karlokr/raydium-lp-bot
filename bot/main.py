@@ -339,11 +339,11 @@ class LiquidityBot:
             return
 
         for rank, pool in enumerate(available_pools):
-            if not self.position_manager.can_open_position(self.available_capital):
+            tracked_capital = initial_balance - committed
+
+            if not self.position_manager.can_open_position(tracked_capital):
                 break
 
-            # Use tracked capital, not RPC balance
-            tracked_capital = initial_balance - committed
             if tracked_capital <= config.RESERVE_SOL:
                 print(f"⚠ Tracked capital ({tracked_capital:.4f} SOL) at reserve floor "
                       f"({config.RESERVE_SOL:.4f} SOL) — not entering new positions")
