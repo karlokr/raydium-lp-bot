@@ -170,16 +170,3 @@ class PoolAnalyzer:
         price_change = current_price_ratio / entry_price_ratio
         il = 2 * math.sqrt(price_change) / (1 + price_change) - 1
         return il
-
-    @staticmethod
-    def estimate_fees_earned(
-        pool: Dict,
-        position_size_sol: float,
-        time_held_hours: float,
-    ) -> float:
-        """Estimate fees earned based on pool's 24h APR."""
-        day = pool.get('day', {})
-        apr_pct = day.get('apr', 0) or pool.get('apr24h', 0)
-        apr_decimal = apr_pct / 100
-        hourly_rate = apr_decimal / (365 * 24)
-        return position_size_sol * hourly_rate * time_held_hours

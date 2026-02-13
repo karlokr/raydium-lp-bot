@@ -462,11 +462,12 @@ class LiquidityBot:
             print(f"\nActive Positions:")
             for amm_id, pos in self.position_manager.active_positions.items():
                 pnl_usd = f" (${pos.unrealized_pnl_sol * sol_price:.2f})" if sol_price > 0 else ""
+                size_str = self._usd(pos.position_size_sol, sol_price)
                 lp_val_str = ""
                 if pos.current_lp_value_sol > 0:
                     lp_val_str = f" | Value: {self._usd(pos.current_lp_value_sol, sol_price)}"
                 print(f"  • {pos.pool_name}")
-                print(f"    Time: {pos.time_held_hours:.1f}h | IL: {pos.current_il_percent:.2f}% | "
+                print(f"    Size: {size_str} | Time: {pos.time_held_hours:.1f}h | IL: {pos.current_il_percent:.2f}% | "
                       f"P&L: {pos.unrealized_pnl_sol:.4f} SOL{pnl_usd} ({pos.pnl_percent:.2f}%){lp_val_str}")
 
         print(f"{'─' * 60}\n")
