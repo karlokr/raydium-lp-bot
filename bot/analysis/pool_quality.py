@@ -16,10 +16,13 @@ Hard-reject criteria (any = pool rejected):
 - Token has freeze or mint authority
 - LP burn < 50%
 - Low TVL + extreme APR (rug pull pattern)
+- On-chain LP lock < MIN_SAFE_LP_PERCENT (default 50%)
+- Single wallet holds > MAX_SINGLE_LP_HOLDER_PERCENT (default 25%) of unlocked LP
 """
 from typing import Dict, List
 from bot.config import config
 from bot.safety.rugcheck import RugCheckAPI
+from bot.safety.liquidity_lock import LiquidityLockAnalyzer
 from bot.raydium_client import WSOL_MINT
 
 # RugCheck danger risk names that are automatic hard rejections.
@@ -41,6 +44,7 @@ class PoolQualityAnalyzer:
 
     def __init__(self):
         self.rugcheck = RugCheckAPI()
+        self.lp_lock = LiquidityLockAnalyzer()
 
     def analyze_pool(self, pool: Dict, check_safety: bool = True) -> Dict:
         """
@@ -162,6 +166,58 @@ class PoolQualityAnalyzer:
                 else:
                     warnings.append("RugCheck data unavailable for this token")
 
+        # --- On-chain LP Lock Analysis ---
+        # burnPercent (from API) = what % of initial LP was destroyed at creation.
+        # On-chain LP lock = of the REMAINING circulating LP, who controls it?
+        #
+        # Combined risk: what % of the pool's TOTAL initial liquidity can
+        # a single wallet pull?  = max_single_unlocked_pct × (1 - burnPercent/100)
+        #
+        # Example: burnPercent=99%, top holder has 50% of remaining LP
+        #   → they can pull 50% × 1% = 0.5% of total liquidity → negligible
+        # Example: burnPercent=50%, top holder has 60% of remaining LP
+        #   → they can pull 60% × 50% = 30% of total liquidity → dangerous
+        lp_lock_result = None
+        if check_safety and config.CHECK_LP_LOCK:
+            lp_mint_info = pool.get('lpMint', {})
+            lp_mint_addr = lp_mint_info.get('address', '') if isinstance(lp_mint_info, dict) else ''
+            if lp_mint_addr:
+                lp_lock_result = self.lp_lock.analyze_lp_lock(lp_mint_addr)
+                if lp_lock_result.get('available'):
+                    remaining_frac = (100 - burn_percent) / 100  # fraction of initial LP still circulating
+                    max_single_unlocked = lp_lock_result.get('max_single_unlocked_pct', 0)
+                    safe_pct = lp_lock_result.get('safe_pct', 0)
+
+                    # What % of TOTAL initial pool liquidity can the biggest holder pull?
+                    max_pullable_pct = max_single_unlocked * remaining_frac
+
+                    # What % of TOTAL initial pool liquidity is in unlocked wallets?
+                    total_unlocked_pct = lp_lock_result.get('unlocked_pct', 0) * remaining_frac
+
+                    if max_pullable_pct > config.MAX_SINGLE_LP_HOLDER_PERCENT:
+                        risks.append(
+                            f"LP whale can pull {max_pullable_pct:.1f}% of pool liquidity "
+                            f"({max_single_unlocked:.0f}% of remaining LP × "
+                            f"{remaining_frac*100:.1f}% circulating, "
+                            f"max allowed: {config.MAX_SINGLE_LP_HOLDER_PERCENT}%)"
+                        )
+
+                    # Overall safety: burned% + locked% of remaining
+                    effective_safe_pct = burn_percent + safe_pct * remaining_frac
+                    if effective_safe_pct < config.MIN_SAFE_LP_PERCENT:
+                        risks.append(
+                            f"Only {effective_safe_pct:.1f}% of total LP is safe "
+                            f"(burned={burn_percent:.0f}% + locked={safe_pct*remaining_frac:.1f}%, "
+                            f"min required: {config.MIN_SAFE_LP_PERCENT}%)"
+                        )
+                    elif effective_safe_pct < 90:
+                        warnings.append(
+                            f"LP safety {effective_safe_pct:.1f}% "
+                            f"(burned={burn_percent:.0f}% + locked={safe_pct*remaining_frac:.1f}%)"
+                        )
+                else:
+                    warnings.append("On-chain LP lock data unavailable")
+
         # Determine overall risk level
         if risks:
             risk_level = "HIGH"
@@ -178,6 +234,7 @@ class PoolQualityAnalyzer:
             'burn_percent': burn_percent,
             'liquidity_tier': 'high' if tvl > 100_000 else 'medium' if tvl > 50_000 else 'low',
             'rugcheck': rugcheck_result,
+            'lp_lock': lp_lock_result,
         }
 
     @staticmethod

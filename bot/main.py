@@ -651,9 +651,168 @@ class LiquidityBot:
 
         print(f"{'─' * 60}\n")
 
+    def _startup_position_check(self):
+        """At startup, if there are restored positions, show live details
+        and ask the user whether to close them or continue."""
+        positions = self.position_manager.active_positions
+        if not positions:
+            return
+
+        sol_price = self.api_client.get_sol_price_usd()
+
+        print(f"\n{'=' * 60}")
+        print(f"  EXISTING POSITIONS ({len(positions)})")
+        print(f"{'=' * 60}")
+        print(f"  Fetching live on-chain data...")
+
+        # Fetch live data for each position
+        total_entry = 0.0
+        total_value = 0.0
+        total_pnl = 0.0
+
+        for i, (amm_id, pos) in enumerate(positions.items(), 1):
+            lp_value = 0.0
+            current_price = 0.0
+            pool = {}
+            lp_balance_raw = 0.0
+
+            # Fresh pool data from API
+            pool = self.api_client.get_pool_by_id(amm_id) or {}
+
+            # On-chain LP token balance
+            if pos.lp_mint and self.executor:
+                lp_balance_raw = self.executor.get_token_balance(pos.lp_mint)
+
+            # On-chain LP value and price from reserves
+            if pos.lp_mint and pos.lp_token_amount > 0 and self.executor:
+                data = self.executor.get_lp_value_sol(amm_id, pos.lp_mint)
+                if data:
+                    lp_value = data.get('valueSol', 0)
+                    current_price = data.get('priceRatio', 0)
+
+            # Fallback price from API
+            if current_price <= 0 and pool:
+                current_price = self.price_tracker.get_current_price(amm_id, pool)
+
+            # Update metrics with live data
+            if current_price > 0:
+                pos.update_metrics(current_price, pool,
+                                   lp_value_sol=lp_value if lp_value > 0 else None)
+
+            pnl_sol = pos.unrealized_pnl_sol
+            pnl_pct = pos.pnl_percent
+            price_chg = pos.price_change_percent
+
+            total_entry += pos.position_size_sol
+            if lp_value > 0:
+                total_value += lp_value
+                total_pnl += pnl_sol
+
+            price_arrow = "↑" if price_chg > 0.5 else "↓" if price_chg < -0.5 else "→"
+            pnl_icon = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < -0.5 else "⚪"
+
+            hours_held = pos.time_held_hours
+            time_left = max(0, config.MAX_HOLD_TIME_HOURS - hours_held)
+            if hours_held < 1:
+                time_str = f"{hours_held * 60:.0f}m"
+            elif hours_held < 24:
+                time_str = f"{hours_held:.1f}h"
+            else:
+                time_str = f"{hours_held / 24:.1f}d"
+            time_left_str = f"{time_left:.0f}h left" if time_left >= 1 else f"{time_left * 60:.0f}m left"
+
+            il_pct = pos.current_il_percent
+            il_str = f"{il_pct:.4f}%" if abs(il_pct) < 1.0 else f"{il_pct:.2f}%"
+
+            day = pool.get('day', {})
+            apr = day.get('apr', 0) or pool.get('apr24h', 0)
+            tvl = pool.get('tvl', 0)
+
+            lp_decimals = pos.lp_decimals if pos.lp_decimals > 0 else 9
+            lp_human = lp_balance_raw / (10 ** lp_decimals) if lp_balance_raw > 0 else pos.lp_token_amount
+
+            print(f"\n{'─' * 60}")
+            print(f"  {pnl_icon} #{i}: {pos.pool_name}")
+            print(f"{'─' * 60}")
+            print(f"  Entry: {self._usd(pos.position_size_sol, sol_price)}")
+            if lp_value > 0:
+                print(f"  Value: {self._usd(lp_value, sol_price)}")
+            else:
+                print(f"  Value: — (could not fetch)")
+            pnl_usd = f" (${pnl_sol * sol_price:.2f})" if sol_price > 0 and lp_value > 0 else ""
+            print(f"  P&L:   {pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)")
+            print(f"  IL:    {il_str}  |  Price: {price_arrow} {price_chg:+.1f}%")
+            print(f"  Held:  {time_str} ({time_left_str})  |  LP: {lp_human:.6f}"
+                  + ("" if lp_balance_raw > 0 else " ⚠ not found on-chain"))
+            if apr > 0:
+                print(f"  APR:   {apr:.1f}%" + (f"  |  TVL: ${tvl:,.0f}" if tvl > 0 else ""))
+
+        # Summary
+        print(f"\n{'═' * 60}")
+        print(f"  {len(positions)} position(s)  |  Entry: {self._usd(total_entry, sol_price)}", end="")
+        if total_value > 0:
+            ret_pct = (total_pnl / total_entry * 100) if total_entry > 0 else 0
+            print(f"  →  Value: {self._usd(total_value, sol_price)}  |  P&L: {total_pnl:+.4f} SOL ({ret_pct:+.2f}%)")
+        else:
+            print()
+        print(f"  Wallet: {self._usd(self.available_capital, sol_price)}")
+        print(f"{'═' * 60}")
+
+        # Ask user what to do
+        can_close = (self.executor and not config.DRY_RUN and config.TRADING_ENABLED)
+        if can_close:
+            print(f"\n  [Enter]  Continue with these positions")
+            print(f"  [close]  Close ALL positions and start fresh")
+        else:
+            print(f"\n  Press Enter to continue...")
+
+        try:
+            answer = input("\n  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            sys.exit(0)
+
+        if answer != 'close' or not can_close:
+            print(f"  ✓ Continuing with {len(positions)} existing position(s)\n")
+            return
+
+        # Double confirm
+        try:
+            confirm = input(f"  ⚠ Close {len(positions)} position(s) on-chain? Type 'confirm': ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled — continuing with existing positions\n")
+            return
+
+        if confirm != 'confirm':
+            print(f"  ✓ Continuing with {len(positions)} existing position(s)\n")
+            return
+
+        # Close all positions
+        print()
+        closed = 0
+        for amm_id, pos in list(positions.items()):
+            print(f"  🔄 Closing {pos.pool_name}...")
+            success = self._exit_position(amm_id, "Manual close (startup)")
+            if success:
+                closed += 1
+            else:
+                print(f"  ✗ Failed to close {pos.pool_name}")
+
+        # Unwrap any remaining WSOL
+        if self.executor:
+            unwrapped = self.executor.unwrap_wsol()
+            if unwrapped > 0:
+                print(f"  ✓ Unwrapped {unwrapped:.4f} WSOL")
+
+        self._refresh_balance()
+        print(f"\n  ✓ Closed {closed} position(s)  |  Balance: {self._usd(self.available_capital, sol_price)}\n")
+
     def run(self):
         """Main bot loop."""
         self.running = True
+
+        # Show existing positions and let user close them before starting
+        self._startup_position_check()
 
         # Register signal handlers for graceful shutdown
         def _signal_handler(sig, frame):
@@ -664,7 +823,7 @@ class LiquidityBot:
         signal.signal(signal.SIGTERM, _signal_handler)
 
         print("\n🚀 Starting bot main loop...")
-        print("Press Ctrl+C to stop (will exit all positions)\n")
+        print("Press Ctrl+C to stop\n")
 
         try:
             iteration = 0

@@ -35,6 +35,11 @@ class BotConfig:
     MAX_SINGLE_HOLDER_PERCENT: float = 15.0  # Reject if any single holder owns more than this %
     MIN_TOKEN_HOLDERS: int = 100  # Reject tokens with fewer holders (thin markets = easy to manipulate)
 
+    # LP Lock Safety (on-chain analysis of LP token distribution)
+    CHECK_LP_LOCK: bool = True  # Check on-chain LP holder distribution
+    MIN_SAFE_LP_PERCENT: float = 50.0  # Min % of LP that must be safely locked (burned + protocol + contract)
+    MAX_SINGLE_LP_HOLDER_PERCENT: float = 25.0  # Reject if any single wallet holds more than this % of unlocked LP
+
     # Position Sizing
     MAX_ABSOLUTE_POSITION_SOL: float = 5.0  # Hard cap per position in SOL
     MIN_POSITION_SOL: float = 0.05  # Minimum position size (below this, fees eat returns)
