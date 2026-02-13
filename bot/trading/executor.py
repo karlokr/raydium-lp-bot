@@ -193,11 +193,6 @@ class RaydiumExecutor:
                 env=os.environ.copy(),
             )
 
-            # Show bridge debug output
-            if result.stderr and result.stderr.strip():
-                for line in result.stderr.strip().split('\n'):
-                    print(f"  [bridge] {line}")
-
             response = None
             if result.stdout and result.stdout.strip():
                 try:
@@ -263,11 +258,6 @@ class RaydiumExecutor:
                 env=os.environ.copy(),
             )
 
-            # Show bridge debug output
-            if result.stderr and result.stderr.strip():
-                for line in result.stderr.strip().split('\n'):
-                    print(f"  [bridge] {line}")
-
             response = None
             if result.stdout and result.stdout.strip():
                 try:
@@ -328,11 +318,6 @@ class RaydiumExecutor:
                 timeout=60,
                 env=os.environ.copy(),
             )
-
-            # Show bridge debug output
-            if result.stderr and result.stderr.strip():
-                for line in result.stderr.strip().split('\n'):
-                    print(f"  [bridge] {line}")
 
             response = None
             if result.stdout and result.stdout.strip():
