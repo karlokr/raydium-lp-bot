@@ -19,12 +19,12 @@ class BotConfig:
     RPC_ENDPOINT: str = os.getenv('SOLANA_RPC_URL', "https://api.mainnet-beta.solana.com")
 
     # API Caching
-    API_CACHE_TTL: int = 300  # 5 minutes
+    API_CACHE_TTL: int = 120  # 2 minutes (meme pools change fast)
 
     # Pool Filtering
     MIN_LIQUIDITY_USD: float = 10_000  # Minimum $10k TVL
     MIN_VOLUME_TVL_RATIO: float = 0.5  # 24h volume should be >50% of TVL
-    MIN_APR_24H: float = 5.0  # Minimum 5% APR
+    MIN_APR_24H: float = 50.0  # Minimum 50% APR (meme pools typically show 100%+)
     MIN_BURN_PERCENT: float = 50.0  # Minimum 50% LP tokens burned
     REQUIRE_WSOL_PAIRS: bool = True  # Only trade pairs with WSOL
 
@@ -40,8 +40,8 @@ class BotConfig:
     RESERVE_SOL: float = 0.05  # Fixed SOL reserve for tx fees + ATA rent
 
     # Risk Management
-    STOP_LOSS_PERCENT: float = -4.0  # Exit if down 4% (after fees/IL)
-    TAKE_PROFIT_PERCENT: float = 6.0  # Exit if up 6% (after fees/IL)
+    STOP_LOSS_PERCENT: float = -15.0  # Exit if down 15% (wide enough for meme volatility)
+    TAKE_PROFIT_PERCENT: float = 10.0  # Exit if up 10% (covers ~2-3% slippage drag on exit)
     MAX_HOLD_TIME_HOURS: int = 24  # Force exit after 24 hours
     MAX_IMPERMANENT_LOSS: float = -3.0  # Exit if IL exceeds 3%
 
@@ -51,7 +51,7 @@ class BotConfig:
     SLIPPAGE_PERCENT: float = 5.0  # Slippage tolerance (5% for volatile meme pools)
 
     # Monitoring
-    POOL_SCAN_INTERVAL_SEC: int = 300  # Scan for new pools every 5 minutes
+    POOL_SCAN_INTERVAL_SEC: int = 180  # Scan for new pools every 3 minutes
     POSITION_CHECK_INTERVAL_SEC: int = 10  # Check positions every 10 seconds
 
     # Safety
