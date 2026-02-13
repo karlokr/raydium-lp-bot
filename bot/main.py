@@ -90,6 +90,36 @@ class LiquidityBot:
                 self.available_capital = 1.0
                 print(f"💰 Dry run mode: simulated {self.available_capital:.4f} SOL")
 
+    def _wait_for_balance_change(self, previous_balance: float,
+                                  max_attempts: int = 10, interval: float = 1.5):
+        """Poll RPC until balance changes from previous_balance and stabilizes.
+
+        After on-chain transactions, Solana RPC can return stale getBalance
+        results for several seconds. This method keeps polling until the
+        balance is different from the previous value AND stays the same
+        for two consecutive reads (stable).
+        """
+        if not self.executor or config.DRY_RUN:
+            return
+
+        last_balance = None
+        for attempt in range(max_attempts):
+            time.sleep(interval)
+            new_balance = self.executor.get_balance()
+
+            if abs(new_balance - previous_balance) > 0.0001:
+                # Balance changed — check if it's stable (same as last read)
+                if last_balance is not None and abs(new_balance - last_balance) < 0.0001:
+                    self.available_capital = new_balance
+                    print(f"💰 Wallet balance: {new_balance:.4f} SOL")
+                    return
+                last_balance = new_balance
+            else:
+                last_balance = None  # Still stale, reset stability check
+
+        # Timed out — use whatever we got last
+        self._refresh_balance()
+
     def _recover_leftover_lp_tokens(self):
         """Find any leftover LP tokens from previous runs and convert them back to SOL.
 
@@ -378,6 +408,7 @@ class LiquidityBot:
                 continue
 
             amm_id = pool['ammId']
+            balance_before = self.available_capital
 
             if not config.DRY_RUN and self.executor:
                 # Step 1: Swap half the SOL into the other token
@@ -393,7 +424,7 @@ class LiquidityBot:
                     print(f"✗ Swap failed - removing position, trying next pool")
                     self.position_manager.close_position(amm_id)
                     self._failed_pools.add(amm_id)
-                    self._refresh_balance()
+                    self._wait_for_balance_change(balance_before)
                     continue
 
                 # Brief delay for on-chain state to settle
@@ -418,7 +449,7 @@ class LiquidityBot:
                     )
                     self.position_manager.close_position(amm_id)
                     self._failed_pools.add(amm_id)
-                    self._refresh_balance()
+                    self._wait_for_balance_change(balance_before)
                     continue
 
                 position.pool_data['entry_signature'] = add_result['signature']
@@ -436,7 +467,8 @@ class LiquidityBot:
                     position.lp_token_amount = lp_raw / (10 ** lp_decimals)
                     print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
 
-            self._refresh_balance()
+            # Wait for balance to reflect the transaction before sizing the next position
+            self._wait_for_balance_change(balance_before)
 
     @staticmethod
     def _usd(sol_amount: float, sol_price: float) -> str:
