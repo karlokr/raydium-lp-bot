@@ -833,67 +833,95 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
             throw new Error('Pool has zero reserves (base: ' + baseReserve.toString() + ', quote: ' + quoteReserve.toString() + '). Pool may be empty or inactive.');
         }
         
-        // Re-fetch token accounts after wrapping
-        const updatedTokenAccounts = await getOwnerTokenAccounts();
-        console.error('  Token accounts: ' + updatedTokenAccounts.length + ' found');
-        
-        // Log which accounts match input/output
-        for (const acct of updatedTokenAccounts) {
-            const mintStr = acct.accountInfo.mint.toString();
-            if (mintStr === inputToken.mint.toString() || mintStr === outputToken.mint.toString()) {
-                console.error('  Account ' + acct.pubkey.toString() + ' mint=' + mintStr + ' amount=' + acct.accountInfo.amount.toString());
-            }
+        // Compute amounts first to catch errors early.
+        // The SDK's computeAmountOut internally calls BN.toNumber() which throws
+        // "Number can only safely store up to 53 bits" when pool reserves exceed
+        // 2^53 raw units (e.g. tokens with 9 decimals and >9M supply).
+        // Fallback: compute manually using Decimal (arbitrary precision).
+        let amountOut, minAmountOut;
+        try {
+            const computed = Liquidity.computeAmountOut({
+                poolKeys,
+                poolInfo,
+                amountIn: amountInToken,
+                currencyOut: outputToken,
+                slippage: slippagePercent,
+            });
+            amountOut = computed.amountOut;
+            minAmountOut = computed.minAmountOut;
+        } catch (sdkErr) {
+            if (!sdkErr.message.includes('53 bit')) throw sdkErr;
+            console.error('  SDK computeAmountOut overflow — using Decimal fallback');
+
+            // Raydium V4 constant-product AMM: fee = 25 bps (0.25%)
+            const FEE_NUMERATOR = 25;
+            const FEE_DENOMINATOR = 10000;
+
+            // Determine input/output reserves
+            const inputIsBase = inputToken.mint.equals(poolKeys.baseMint);
+            const inReserve  = new Decimal((inputIsBase ? baseReserve : quoteReserve).toString());
+            const outReserve = new Decimal((inputIsBase ? quoteReserve : baseReserve).toString());
+
+            const amountInDec  = new Decimal(amountInRaw.toString());
+            const amountInFee  = amountInDec.mul(FEE_DENOMINATOR - FEE_NUMERATOR).div(FEE_DENOMINATOR);
+            const numerator    = amountInFee.mul(outReserve);
+            const denominator  = inReserve.add(amountInFee);
+            const amountOutRaw = numerator.div(denominator).floor();
+
+            // Apply slippage
+            const slippageMul  = new Decimal(1).minus(new Decimal(slippage).div(100));
+            const minOutRaw    = amountOutRaw.mul(slippageMul).floor();
+
+            amountOut    = new TokenAmount(outputToken, new BN(amountOutRaw.toFixed(0)), true);
+            minAmountOut = new TokenAmount(outputToken, new BN(minOutRaw.toFixed(0)), true);
         }
         
-        // Compute amounts first to catch errors early
-        const { amountOut, minAmountOut } = Liquidity.computeAmountOut({
-            poolKeys,
-            poolInfo,
-            amountIn: amountInToken,
-            currencyOut: outputToken,
-            slippage: slippagePercent,
-        });
+        console.error('  Expected out: ' + amountOut.raw.toString() + ' raw, Min out: ' + minAmountOut.raw.toString() + ' raw');
         
-        console.error('  Expected out: ' + amountOut.toFixed() + ', Min out: ' + minAmountOut.toFixed());
-        
-        const { innerTransactions } = await Liquidity.makeSwapInstructionSimple({
-            connection,
+        // Use makeSwapInstruction (NOT makeSwapInstructionSimple) because the
+        // Simple version internally re-calls computeAmountOut which hits the
+        // same 53-bit overflow on pools with large reserves.
+        // makeSwapInstruction just builds the instruction from our pre-computed values.
+        const swapIxs = Liquidity.makeSwapInstruction({
             poolKeys,
             userKeys: {
-                tokenAccounts: updatedTokenAccounts,
+                tokenAccountIn: inputToken.mint.equals(poolKeys.baseMint) ? baseAta : quoteAta,
+                tokenAccountOut: outputToken.mint.equals(poolKeys.baseMint) ? baseAta : quoteAta,
                 owner: wallet.publicKey,
             },
-            amountIn: amountInToken,
-            amountOut: minAmountOut,
+            amountIn: amountInRaw,
+            amountOut: minAmountOut.raw,
             fixedSide: 'in',
-            config: {
-                bypassAssociatedCheck: false,
-                checkCreateATAOwner: true,
-            },
-            makeTxVersion: 0,
         });
         
         // Step 7: Send transactions
         console.error('[7/7] Sending swap transaction(s)...');
         const txids = [];
-        for (const itemIxs of innerTransactions) {
-            const tx = new Transaction();
-            tx.add(...itemIxs.instructions);
-            
-            const { blockhash } = await connection.getLatestBlockhash();
-            tx.recentBlockhash = blockhash;
-            tx.feePayer = wallet.publicKey;
-            
-            const signers = [wallet];
-            if (itemIxs.signers && itemIxs.signers.length > 0) {
-                signers.push(...itemIxs.signers);
-            }
-            
-            const signature = await connection.sendTransaction(tx, signers);
-            await connection.confirmTransaction(signature, 'confirmed');
-            txids.push(signature);
-            console.error('  Swap confirmed: ' + signature);
+        
+        // makeSwapInstruction returns { innerTransaction } with instructions + signers
+        const innerTx = swapIxs.innerTransaction || swapIxs;
+        const instructions = innerTx.instructions || [];
+        
+        if (instructions.length === 0) {
+            throw new Error('makeSwapInstruction returned no instructions');
         }
+        
+        const tx = new Transaction();
+        tx.add(...instructions);
+        
+        const { blockhash } = await connection.getLatestBlockhash();
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = wallet.publicKey;
+        
+        const signers = [wallet];
+        if (innerTx.signers && innerTx.signers.length > 0) {
+            signers.push(...innerTx.signers);
+        }
+        
+        const signature = await connection.sendTransaction(tx, signers);
+        await connection.confirmTransaction(signature, 'confirmed');
+        txids.push(signature);
+        console.error('  Swap confirmed: ' + signature);
         
         // Unwrap any remaining WSOL ATA balance back to native SOL after sell
         const outputIsWsol = outputToken.mint.equals(WSOL_MINT);
