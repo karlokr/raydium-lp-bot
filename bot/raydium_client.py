@@ -140,42 +140,45 @@ class RaydiumAPIClient:
         seen_ids = set()
         merged = []
 
-        for sort_field in ('liquidity', 'volume'):
-            page = 1
-            while True:
-                url = (
-                    f"{self.BASE_URL}/pools/info/mint"
-                    f"?mint1={WSOL_MINT}"
-                    f"&poolType=standard"
-                    f"&poolSortField={sort_field}"
-                    f"&sortType=desc"
-                    f"&pageSize=100"
-                    f"&page={page}"
-                )
+        for sort_field in ('liquidity', 'volume24h'):
+            try:
+                page = 1
+                while True:
+                    url = (
+                        f"{self.BASE_URL}/pools/info/mint"
+                        f"?mint1={WSOL_MINT}"
+                        f"&poolType=standard"
+                        f"&poolSortField={sort_field}"
+                        f"&sortType=desc"
+                        f"&pageSize=100"
+                        f"&page={page}"
+                    )
 
-                response = requests.get(url, timeout=15)
-                response.raise_for_status()
-                data = response.json()
+                    response = requests.get(url, timeout=15)
+                    response.raise_for_status()
+                    data = response.json()
 
-                pools_data = data.get('data', {})
-                pools = pools_data.get('data', [])
+                    pools_data = data.get('data', {})
+                    pools = pools_data.get('data', [])
 
-                if not pools:
-                    break
+                    if not pools:
+                        break
 
-                for pool in pools:
-                    normalized = self._normalize_pool(pool)
-                    pool_id = normalized.get('ammId', '')
-                    if pool_id and pool_id not in seen_ids:
-                        seen_ids.add(pool_id)
-                        merged.append(normalized)
+                    for pool in pools:
+                        normalized = self._normalize_pool(pool)
+                        pool_id = normalized.get('ammId', '')
+                        if pool_id and pool_id not in seen_ids:
+                            seen_ids.add(pool_id)
+                            merged.append(normalized)
 
-                if not pools_data.get('hasNextPage', False):
-                    break
+                    if not pools_data.get('hasNextPage', False):
+                        break
 
-                page += 1
-                if page > 10:  # 1000 per sort field max
-                    break
+                    page += 1
+                    if page > 10:  # 1000 per sort field max
+                        break
+            except Exception as e:
+                print(f"⚠ Error fetching pools sorted by {sort_field}: {e}")
 
         return merged
 
