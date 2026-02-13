@@ -1,0 +1,21 @@
+{
+  "name": "raydium-lp-bot",
+  "version": "1.0.0",
+  "description": "Raydium SDK bridge for Python bot",
+  "main": "bridge/raydium_sdk_bridge.js",
+  "type": "module",
+  "scripts": {
+    "test": "node bridge/raydium_sdk_bridge.js test"
+  },
+  "dependencies": {
+    "@raydium-io/raydium-sdk": "^1.3.1-beta.58",
+    "@solana/web3.js": "^1.95.8",
+    "@solana/spl-token": "^0.4.9",
+    "bn.js": "^5.2.1",
+    "decimal.js": "^10.4.3"
+  },
+  "devDependencies": {},
+  "keywords": ["raydium", "solana", "defi", "amm"],
+  "author": "",
+  "license": "MIT"
+}
