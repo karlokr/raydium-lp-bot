@@ -73,9 +73,11 @@ class PoolQualityAnalyzer:
             warnings.append(f"Low liquidity (${tvl:,.0f}) - high slippage risk")
 
         # --- Volume/TVL Ratio ---
+        # High vol/TVL is actually GOOD for LPs (more fees per unit capital).
+        # Only flag as extreme wash-trading concern above 10x.
         vol_tvl = volume / tvl if tvl > 0 else 0
-        if vol_tvl > 5:
-            warnings.append(f"Very high volume/TVL ({vol_tvl:.1f}x) - volatile pool")
+        if vol_tvl > 10:
+            warnings.append(f"Extreme volume/TVL ({vol_tvl:.1f}x) - possible wash trading")
 
         # --- Rug Pull Pattern ---
         if tvl < 5_000 and apr > 500:

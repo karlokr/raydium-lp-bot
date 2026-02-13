@@ -240,6 +240,7 @@ class LiquidityBot:
             print(f"  Top pool: {best['name']} (score: {best['score']:.1f}, "
                   f"burn: {best.get('burnPercent', 0):.0f}%, "
                   f"mom: {best.get('_momentum', 0):.0f}, "
+                  f"IL: {best.get('_il_safety', 0):.0f}, "
                   f"fresh: {best.get('_freshness', 0):.0f}, "
                   f"vel: {best.get('_velocity', 0):.0f}{age_str})")
 

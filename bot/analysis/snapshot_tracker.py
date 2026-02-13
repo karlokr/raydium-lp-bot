@@ -5,7 +5,7 @@ Stores {timestamp, volume, tvl, price} per pool on every scan cycle.
 Computes short-term velocity metrics that the API doesn't provide:
   - Volume velocity: is volume accelerating or decelerating?
   - TVL delta: is liquidity flowing in or draining out?
-  - Price trend: directional move over the observation window
+  - Price stability: tight range = low IL risk (LPs earn fees in both directions)
 
 Typical usage:
   tracker = SnapshotTracker()
@@ -58,8 +58,8 @@ class SnapshotTracker:
 
         Components:
           - Volume acceleration (0–4 pts): is 24h volume rising between scans?
-          - TVL inflow (0–3 pts): is liquidity growing?
-          - Price stability (0–3 pts): reward steady uptrend, penalise chop
+          - TVL stability (0–3 pts): stable TVL = healthy pool, draining = dying
+          - Price stability (0–3 pts): tight range = low IL risk
 
         Returns 0 if not enough data (need >= 3 snapshots).
         """
@@ -84,28 +84,40 @@ class SnapshotTracker:
             # +20% growth = full 4 pts, linear scale, capped
             bonus += min(4.0, max(0.0, (vol_growth / 0.20) * 4.0))
 
-        # --- TVL inflow (0–3 pts) ---
+        # --- TVL stability (0–3 pts) ---
+        # For LPs, stable TVL = healthy pool. Draining TVL = pool dying.
+        # Growing TVL is neutral-to-slightly-bad (fee dilution) but signals
+        # confidence, so we reward stability, not growth.
         first_tvl = snapshots[0].tvl
         last_tvl = snapshots[-1].tvl
         if first_tvl > 0:
             tvl_change = (last_tvl - first_tvl) / first_tvl
-            # +10% TVL growth = full 3 pts
-            bonus += min(3.0, max(0.0, (tvl_change / 0.10) * 3.0))
-            # Penalise TVL drain (but floor at 0 for this component)
+            if abs(tvl_change) < 0.05:
+                # Stable (< 5% change either way) = full 3 pts
+                bonus += 3.0
+            elif tvl_change >= 0.05:
+                # Growing — mild positive (confidence signal, slight dilution)
+                bonus += 1.5
+            elif tvl_change > -0.15:
+                # Mild drain (5-15%) — partial points
+                bonus += max(0.0, 1.5 * (1.0 - abs(tvl_change) / 0.15))
+            # > 15% drain = 0 pts (pool may be dying)
 
-        # --- Price trend (0–3 pts) ---
-        # Reward consistent uptrend; penalise violent chop.
-        # Simple measure: count how many consecutive readings went up
-        ups = 0
-        for i in range(1, len(snapshots)):
-            if snapshots[i].price >= snapshots[i - 1].price:
-                ups += 1
-
-        total_moves = len(snapshots) - 1
-        if total_moves > 0:
-            up_ratio = ups / total_moves
-            # 80%+ rising = 3 pts, 50% = 0, below 50% = 0
-            bonus += min(3.0, max(0.0, (up_ratio - 0.5) / 0.3 * 3.0))
+        # --- Price stability (0–3 pts) ---
+        # LPs earn fees from volume in BOTH directions. What hurts is large
+        # price moves (impermanent loss). Reward tight price range.
+        prices = [s.price for s in snapshots if s.price > 0]
+        if len(prices) >= 2:
+            avg_price = sum(prices) / len(prices)
+            if avg_price > 0:
+                max_deviation = max(abs(p - avg_price) / avg_price for p in prices)
+                # < 2% max deviation = full 3 pts (very tight range)
+                # 2-10% = partial, > 10% = 0
+                if max_deviation <= 0.02:
+                    bonus += 3.0
+                elif max_deviation < 0.10:
+                    bonus += max(0.0, 3.0 * (1.0 - (max_deviation - 0.02) / 0.08))
+                # > 10% deviation = 0 pts (wild swings = IL risk)
 
         return round(min(10.0, bonus), 2)
 
