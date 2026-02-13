@@ -497,7 +497,10 @@ class LiquidityBot:
                 exit_str = f" ⚠ Near: {', '.join(exit_warnings)}" if exit_warnings else ""
 
                 print(f"  {pnl_icon} {pos.pool_name}  {price_arrow} {price_chg:+.1f}%  |  {time_str} ({time_left_str})")
-                print(f"    Entry: {entry_str}  →  Value: {value_str}  |  P&L: {pos.unrealized_pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)  |  IL: {pos.current_il_percent:.2f}%{exit_str}")
+                # Use 4 decimal places for IL since it's very small for typical price moves
+                # (a 5% price change = only 0.03% IL)
+                il_str = f"{pos.current_il_percent:.4f}%" if abs(pos.current_il_percent) < 1.0 else f"{pos.current_il_percent:.2f}%"
+                print(f"    Entry: {entry_str}  →  Value: {value_str}  |  P&L: {pos.unrealized_pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)  |  IL: {il_str}{exit_str}")
 
         print(f"{'─' * 60}\n")
 
