@@ -7,7 +7,7 @@ All transaction building/signing/sending is done by the bridge script.
 import os
 import subprocess
 import json
-from typing import Optional
+from typing import Dict, Optional
 from dotenv import load_dotenv
 
 from solana.rpc.api import Client
@@ -85,31 +85,168 @@ class RaydiumExecutor:
             print(f"Error getting WSOL balance: {e}")
             return 0.0
 
-    def get_wallet_balances(self) -> dict:
-        """Get all wallet balances (SOL + WSOL)."""
-        sol = self.get_balance()
-        wsol = self.get_wsol_balance()
-        return {
-            'sol': sol,
-            'wsol': wsol,
-            'total_sol': sol + wsol,
-        }
+    def unwrap_wsol(self) -> float:
+        """Unwrap all WSOL in the wallet back to native SOL.
+        Returns the amount unwrapped, or 0 if nothing to unwrap."""
+        try:
+            result = subprocess.run(
+                ['node', config.BRIDGE_SCRIPT, 'unwrap'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=os.environ.copy(),
+            )
+            response = None
+            if result.stdout and result.stdout.strip():
+                try:
+                    response = json.loads(result.stdout.strip().split('\n')[-1])
+                except json.JSONDecodeError:
+                    pass
+
+            if response and response.get('success'):
+                return float(response.get('unwrapped', 0))
+            return 0.0
+        except Exception as e:
+            print(f"⚠ Error unwrapping WSOL: {e}")
+            return 0.0
+
+    def get_token_balance(self, token_mint: str) -> float:
+        """Get token balance (raw) for a given mint via bridge."""
+        try:
+            result = subprocess.run(
+                ['node', config.BRIDGE_SCRIPT, 'balance', token_mint],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=os.environ.copy(),
+            )
+            if result.returncode != 0:
+                return 0.0
+            response = json.loads(result.stdout.strip().split('\n')[-1])
+            return float(response.get('balance', 0))
+        except Exception as e:
+            print(f"Error getting token balance: {e}")
+            return 0.0
+
+    def get_lp_value_sol(self, pool_id: str, lp_mint: str) -> Dict:
+        """Get on-chain LP token value and current price ratio.
+        
+        Returns dict with:
+          - valueSol: total SOL value of our LP tokens
+          - priceRatio: current on-chain price (quoteReserve/baseReserve, human units)
+        Returns empty dict on failure.
+        """
+        try:
+            result = subprocess.run(
+                ['node', config.BRIDGE_SCRIPT, 'lpvalue', pool_id, lp_mint],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=os.environ.copy(),
+            )
+            if result.returncode != 0:
+                return {}
+            response = json.loads(result.stdout.strip().split('\n')[-1])
+            value_sol = float(response.get('valueSol', 0))
+            price_ratio = float(response.get('priceRatio', 0))
+            if value_sol > 0:
+                return {'valueSol': value_sol, 'priceRatio': price_ratio}
+            return {}
+        except Exception:
+            return {}
+
+    def swap_tokens(
+        self,
+        pool_id: str,
+        amount_in: float,
+        direction: str = 'buy',
+        slippage: float = None,
+    ) -> Optional[str]:
+        """
+        Swap tokens via a Raydium AMM pool.
+        direction='buy': swap WSOL -> base token
+        direction='sell': swap base token -> WSOL
+        """
+        if not config.TRADING_ENABLED:
+            print("⚠️  Trading disabled (TRADING_ENABLED=False)")
+            return None
+
+        if slippage is None:
+            slippage = config.SLIPPAGE_PERCENT / 100.0
+
+        if config.DRY_RUN:
+            print(f"⚠️  Dry run: would swap {amount_in:.6f} ({direction}) via {pool_id[:8]}...")
+            return f"DRY_RUN_SWAP_{pool_id[:8]}"
+
+        try:
+            result = subprocess.run(
+                [
+                    'node', config.BRIDGE_SCRIPT, 'swap',
+                    pool_id,
+                    str(amount_in),
+                    str(slippage * 100),
+                    direction,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=os.environ.copy(),
+            )
+
+            # Show bridge debug output
+            if result.stderr and result.stderr.strip():
+                for line in result.stderr.strip().split('\n'):
+                    print(f"  [bridge] {line}")
+
+            response = None
+            if result.stdout and result.stdout.strip():
+                try:
+                    response = json.loads(result.stdout.strip().split('\n')[-1])
+                except json.JSONDecodeError:
+                    pass
+
+            if result.returncode != 0:
+                error_msg = response.get('error', result.stderr) if response else result.stderr
+                print(f"✗ Swap failed: {error_msg}")
+                return None
+
+            if response and response.get('success'):
+                signatures = response.get('signatures', [])
+                main_sig = signatures[0] if signatures else 'unknown'
+                print(f"✓ Swap executed: {main_sig}")
+                return main_sig
+            else:
+                error_msg = response.get('error', 'Unknown error') if response else 'No response from bridge'
+                print(f"✗ Swap failed: {error_msg}")
+                return None
+
+        except subprocess.TimeoutExpired:
+            print("✗ Swap timeout")
+            return None
+        except Exception as e:
+            print(f"✗ Swap error: {e}")
+            return None
 
     def add_liquidity(
         self,
         pool_id: str,
         token_a_amount: float,
         token_b_amount: float,
-        slippage: float = 0.01,
-    ) -> Optional[str]:
-        """Add liquidity to a Raydium pool via the SDK bridge."""
+        slippage: float = None,
+    ) -> Optional[Dict]:
+        """Add liquidity to a Raydium pool via the SDK bridge.
+        
+        Returns dict with 'signature' and 'lpMint' on success, or None on failure.
+        """
+        if slippage is None:
+            slippage = config.SLIPPAGE_PERCENT / 100.0
         if not config.TRADING_ENABLED:
             print("⚠️  Trading disabled (TRADING_ENABLED=False)")
             return None
 
         if config.DRY_RUN:
             print(f"⚠️  Dry run: would add {token_a_amount:.6f} A + {token_b_amount:.6f} WSOL to {pool_id[:8]}...")
-            return f"DRY_RUN_{pool_id[:8]}"
+            return {'signature': f"DRY_RUN_{pool_id[:8]}", 'lpMint': ''}
 
         try:
             result = subprocess.run(
@@ -126,19 +263,32 @@ class RaydiumExecutor:
                 env=os.environ.copy(),
             )
 
+            # Show bridge debug output
+            if result.stderr and result.stderr.strip():
+                for line in result.stderr.strip().split('\n'):
+                    print(f"  [bridge] {line}")
+
+            response = None
+            if result.stdout and result.stdout.strip():
+                try:
+                    response = json.loads(result.stdout.strip().split('\n')[-1])
+                except json.JSONDecodeError:
+                    pass
+
             if result.returncode != 0:
-                print(f"✗ Transaction failed: {result.stderr}")
+                error_msg = response.get('error', result.stderr) if response else result.stderr
+                print(f"✗ Transaction failed: {error_msg}")
                 return None
 
-            response = json.loads(result.stdout.strip().split('\n')[-1])
-
-            if response.get('success'):
+            if response and response.get('success'):
                 signatures = response.get('signatures', [])
                 main_sig = signatures[0] if signatures else 'unknown'
+                lp_mint = response.get('lpMint', '')
                 print(f"✓ Liquidity added: {main_sig}")
-                return main_sig
+                return {'signature': main_sig, 'lpMint': lp_mint}
             else:
-                print(f"✗ Transaction failed: {response.get('error')}")
+                error_msg = response.get('error', 'Unknown error') if response else 'No response from bridge'
+                print(f"✗ Transaction failed: {error_msg}")
                 return None
 
         except subprocess.TimeoutExpired:
@@ -152,9 +302,11 @@ class RaydiumExecutor:
         self,
         pool_id: str,
         lp_token_amount: float,
-        slippage: float = 0.01,
+        slippage: float = None,
     ) -> Optional[str]:
         """Remove liquidity from a Raydium pool via the SDK bridge."""
+        if slippage is None:
+            slippage = config.SLIPPAGE_PERCENT / 100.0
         if not config.TRADING_ENABLED:
             print("⚠️  Trading disabled (TRADING_ENABLED=False)")
             return None
@@ -177,19 +329,31 @@ class RaydiumExecutor:
                 env=os.environ.copy(),
             )
 
+            # Show bridge debug output
+            if result.stderr and result.stderr.strip():
+                for line in result.stderr.strip().split('\n'):
+                    print(f"  [bridge] {line}")
+
+            response = None
+            if result.stdout and result.stdout.strip():
+                try:
+                    response = json.loads(result.stdout.strip().split('\n')[-1])
+                except json.JSONDecodeError:
+                    pass
+
             if result.returncode != 0:
-                print(f"✗ Transaction failed: {result.stderr}")
+                error_msg = response.get('error', result.stderr) if response else result.stderr
+                print(f"✗ Transaction failed: {error_msg}")
                 return None
 
-            response = json.loads(result.stdout.strip().split('\n')[-1])
-
-            if response.get('success'):
+            if response and response.get('success'):
                 signatures = response.get('signatures', [])
                 main_sig = signatures[0] if signatures else 'unknown'
                 print(f"✓ Liquidity removed: {main_sig}")
                 return main_sig
             else:
-                print(f"✗ Transaction failed: {response.get('error')}")
+                error_msg = response.get('error', 'Unknown error') if response else 'No response from bridge'
+                print(f"✗ Transaction failed: {error_msg}")
                 return None
 
         except subprocess.TimeoutExpired:
@@ -198,3 +362,24 @@ class RaydiumExecutor:
         except Exception as e:
             print(f"✗ Error: {e}")
             return None
+
+    def list_all_tokens(self) -> list:
+        """List all non-zero token accounts in the wallet via bridge.
+        Returns list of dicts with 'mint' and 'balance' (raw string)."""
+        try:
+            result = subprocess.run(
+                ['node', config.BRIDGE_SCRIPT, 'listtokens'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=os.environ.copy(),
+            )
+            if result.returncode != 0:
+                return []
+            response = json.loads(result.stdout.strip().split('\n')[-1])
+            if response and response.get('success'):
+                return response.get('tokens', [])
+            return []
+        except Exception as e:
+            print(f"⚠ Error listing tokens: {e}")
+            return []

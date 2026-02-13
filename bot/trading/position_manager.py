@@ -13,6 +13,10 @@ from bot.analysis.pool_analyzer import PoolAnalyzer
 _analyzer = PoolAnalyzer()
 
 
+# SOL mint address (used to identify which side of a pool is SOL)
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+
 @dataclass
 class Position:
     """Represents an active LP position."""
@@ -24,14 +28,33 @@ class Position:
     token_a_amount: float
     token_b_amount: float
 
+    # Which side is SOL
+    sol_is_base: bool = False
+
+    # LP token tracking (set after addLiquidity)
+    lp_mint: str = ""
+    lp_token_amount: float = 0.0  # raw LP tokens held
+    lp_decimals: int = 0
+
     # Tracking
     current_price_ratio: float = 0.0
     current_il_percent: float = 0.0
     fees_earned_sol: float = 0.0
     unrealized_pnl_sol: float = 0.0
+    current_lp_value_sol: float = 0.0  # current value of LP tokens in SOL
 
     # Metadata
     pool_data: Dict = field(default_factory=dict)
+
+    @property
+    def sol_amount(self) -> float:
+        """Amount of SOL in this position (half the position size)."""
+        return self.token_a_amount if self.sol_is_base else self.token_b_amount
+
+    @property
+    def other_token_amount(self) -> float:
+        """Amount of the non-SOL token in this position."""
+        return self.token_b_amount if self.sol_is_base else self.token_a_amount
 
     @property
     def time_held_hours(self) -> float:
@@ -60,11 +83,19 @@ class Position:
     def should_exit_il(self) -> bool:
         return self.current_il_percent <= config.MAX_IMPERMANENT_LOSS
 
-    def update_metrics(self, current_price: float, pool_data: Dict):
-        """Update position metrics with current data."""
+    def update_metrics(self, current_price: float, pool_data: Dict,
+                        lp_value_sol: float = None):
+        """Update position metrics with current data.
+        
+        If lp_value_sol is provided (from on-chain LP token valuation),
+        PnL is computed directly as actual_value - entry_cost.
+        Otherwise PnL stays at 0 (unknown) — we never guess from APR.
+        IL is always computed from the price ratio.
+        """
         self.current_price_ratio = current_price
         self.pool_data = pool_data
 
+        # IL from price ratio (always computed when we have prices)
         if self.entry_price_ratio > 0 and self.current_price_ratio > 0:
             self.current_il_percent = _analyzer.calculate_impermanent_loss(
                 self.entry_price_ratio,
@@ -73,14 +104,24 @@ class Position:
         else:
             self.current_il_percent = 0.0
 
-        self.fees_earned_sol = _analyzer.estimate_fees_earned(
-            pool_data,
-            self.position_size_sol,
-            self.time_held_hours
-        )
-
-        il_loss_sol = (self.current_il_percent / 100) * self.position_size_sol
-        self.unrealized_pnl_sol = self.fees_earned_sol + il_loss_sol
+        if lp_value_sol is not None and lp_value_sol > 0:
+            # Sanity check: LP value should not be wildly different from entry size.
+            # Reject if > 5x entry size (clearly a calculation error).
+            if self.position_size_sol > 0 and lp_value_sol > self.position_size_sol * 5:
+                # Bad data — ignore this reading
+                self.unrealized_pnl_sol = 0.0
+                self.fees_earned_sol = 0.0
+            else:
+                # Real PnL from on-chain LP token value
+                self.current_lp_value_sol = lp_value_sol
+                self.unrealized_pnl_sol = lp_value_sol - self.position_size_sol
+                # Back-derive fees: pnl = fees + il_loss => fees = pnl - il_loss
+                il_loss_sol = (self.current_il_percent / 100) * self.position_size_sol
+                self.fees_earned_sol = self.unrealized_pnl_sol - il_loss_sol
+        else:
+            # No on-chain data available — PnL unknown, don't guess
+            self.unrealized_pnl_sol = 0.0
+            self.fees_earned_sol = 0.0
 
 
 class PositionManager:
@@ -102,8 +143,22 @@ class PositionManager:
         pool: Dict,
         available_capital: float,
         current_price: float,
+        sol_price_usd: float = 0.0,
+        total_wallet_balance: float = 0.0,
+        rank: int = 0,
+        total_ranked: int = 1,
     ) -> Optional[Position]:
-        """Open a new LP position."""
+        """Open a new LP position.
+        
+        Args:
+            pool: Pool data dict.
+            available_capital: Current available SOL (after deployed positions).
+            current_price: Current price ratio for the pool.
+            sol_price_usd: SOL/USD price for display.
+            total_wallet_balance: Original total wallet balance (for reserve calc).
+            rank: This pool's rank (0 = best score, higher = worse).
+            total_ranked: Total number of ranked candidate pools.
+        """
         if not self.can_open_position(available_capital):
             print(f"✗ Cannot open position: max positions or no capital")
             return None
@@ -112,18 +167,34 @@ class PositionManager:
         position_size = self.analyzer.calculate_position_size(
             pool,
             available_capital,
-            num_open_positions=num_open
+            num_open_positions=num_open,
+            total_wallet_balance=total_wallet_balance,
+            rank=rank,
+            total_ranked=total_ranked,
         )
 
         if position_size < 0.01:
             print(f"✗ Position too small: {position_size:.4f} SOL")
             return None
 
-        # Split position 50/50 between token A and WSOL
-        token_a_value = position_size / 2
-        token_b_value = position_size / 2
-        token_a_amount = token_a_value / current_price if current_price > 0 else 0
-        token_b_amount = token_b_value
+        # Determine which side of the pool is SOL
+        base_mint = pool.get('baseMint', '')
+        sol_is_base = (base_mint == SOL_MINT)
+
+        # Split position 50/50 between SOL and the other token
+        sol_value = position_size / 2
+        other_value = position_size / 2
+
+        if sol_is_base:
+            # SOL is mintA (base), other token is mintB (quote)
+            # price = mintB_amount / mintA_amount, so other_amount = sol_value * price
+            token_a_amount = sol_value  # SOL amount
+            token_b_amount = other_value * current_price if current_price > 0 else 0
+        else:
+            # Other token is mintA (base), SOL is mintB (quote)
+            # price = mintB_amount / mintA_amount = SOL_per_token
+            token_a_amount = other_value / current_price if current_price > 0 else 0
+            token_b_amount = sol_value  # SOL amount
 
         amm_id = pool.get('ammId', pool.get('id', ''))
 
@@ -135,27 +206,37 @@ class PositionManager:
             position_size_sol=position_size,
             token_a_amount=token_a_amount,
             token_b_amount=token_b_amount,
+            sol_is_base=sol_is_base,
             pool_data=pool,
         )
 
         position.current_price_ratio = current_price
         self.active_positions[amm_id] = position
 
-        positions_remaining = config.MAX_CONCURRENT_POSITIONS - num_open
-        dynamic_percent = (1.0 / positions_remaining) * 100
+        # Show how much of the total wallet is being deployed
+        deploy_percent = (position_size / total_wallet_balance * 100) if total_wallet_balance > 0 else 0
+        reserve_after = available_capital - position_size
+        reserve_pct = (reserve_after / total_wallet_balance * 100) if total_wallet_balance > 0 else 0
 
         day = pool.get('day', {})
         apr = day.get('apr', 0) or pool.get('apr24h', 0)
+        score = pool.get('score', 0)
 
         print(f"✓ Opened position in {pool.get('name', 'Unknown')}")
-        print(f"  Size: {position_size:.4f} SOL ({dynamic_percent:.1f}% of available capital)")
+        size_str = f"{position_size:.4f} SOL"
+        if sol_price_usd > 0:
+            size_str += f" (${position_size * sol_price_usd:.2f})"
+        print(f"  Size: {size_str} ({deploy_percent:.1f}% of wallet)")
+        print(f"  Reserve after: {reserve_after:.4f} SOL ({reserve_pct:.1f}% of wallet)")
+        print(f"  Pool score: {score:.1f} (rank #{rank + 1})")
         print(f"  Entry price: {current_price:.10f}")
         print(f"  Expected APR: {apr:.2f}%")
         print(f"  Position {num_open + 1}/{config.MAX_CONCURRENT_POSITIONS}")
 
         return position
 
-    def close_position(self, amm_id: str, reason: str = "Manual") -> bool:
+    def close_position(self, amm_id: str, reason: str = "Manual",
+                        sol_price_usd: float = 0.0) -> bool:
         """Close an LP position."""
         if amm_id not in self.active_positions:
             print(f"✗ Position not found: {amm_id}")
@@ -163,12 +244,17 @@ class PositionManager:
 
         position = self.active_positions[amm_id]
 
+        def _sol_usd(sol: float) -> str:
+            if sol_price_usd > 0:
+                return f"{sol:.4f} SOL (${sol * sol_price_usd:.2f})"
+            return f"{sol:.4f} SOL"
+
         print(f"✓ Closing position in {position.pool_name}")
         print(f"  Reason: {reason}")
         print(f"  Time held: {position.time_held_hours:.1f}h")
         print(f"  IL: {position.current_il_percent:.2f}%")
-        print(f"  Fees earned: {position.fees_earned_sol:.4f} SOL")
-        print(f"  Net P&L: {position.unrealized_pnl_sol:.4f} SOL")
+        print(f"  Fees earned: {_sol_usd(position.fees_earned_sol)}")
+        print(f"  Net P&L: {_sol_usd(position.unrealized_pnl_sol)}")
 
         del self.active_positions[amm_id]
         return True

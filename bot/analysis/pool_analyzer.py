@@ -97,25 +97,59 @@ class PoolAnalyzer:
         ranked = sorted(scored_pools, key=lambda x: x['score'], reverse=True)
         return ranked[:top_n]
 
+    # Reserve SOL for ATA rent (3 accounts × ~0.00203) + transaction fees
+    ATA_RENT_RESERVE_SOL = 0.01
+
     def calculate_position_size(
         self,
         pool: Dict,
         available_capital: float,
         num_open_positions: int = 0,
+        total_wallet_balance: float = 0.0,
+        rank: int = 0,
+        total_ranked: int = 1,
     ) -> float:
         """
         Calculate optimal position size in SOL.
-        Uses dynamic sizing to distribute capital across positions.
+
+        Position sizing rules:
+        1. A reserve is always kept: max(balance * RESERVE_PERCENT, MIN_RESERVE_SOL)
+        2. The best-ranked pool (rank=0) gets the largest allocation.
+           With 1 position slot, it gets POSITION_SIZE_PERCENT of deployable capital.
+        3. With multiple slots, higher-ranked pools get proportionally more
+           (descending weight: rank 0 biggest, rank N-1 smallest).
+        4. Never exceed MAX_ABSOLUTE_POSITION_SOL.
         """
         positions_remaining = config.MAX_CONCURRENT_POSITIONS - num_open_positions
         if positions_remaining <= 0:
             return 0.0
 
-        max_deploy_percent = 1.0 - config.RESERVE_PERCENT
-        dynamic_percent = min(1.0 / positions_remaining, max_deploy_percent)
+        # Use total_wallet_balance to compute reserve (if provided)
+        reference_balance = total_wallet_balance if total_wallet_balance > 0 else available_capital
+
+        # Reserve: the larger of percentage-based or absolute minimum
+        reserve = max(
+            reference_balance * config.RESERVE_PERCENT,
+            config.MIN_RESERVE_SOL,
+        )
+        # Also keep ATA rent aside
+        reserve += self.ATA_RENT_RESERVE_SOL
+
+        deployable = available_capital - reserve
+        if deployable <= 0:
+            return 0.0
+
+        # Position sizing by slot count
+        if config.MAX_CONCURRENT_POSITIONS == 1:
+            # Single-position mode: use POSITION_SIZE_PERCENT (e.g. 80%)
+            alloc_percent = config.POSITION_SIZE_PERCENT
+        else:
+            # Multiple positions: split evenly across remaining slots
+            # Each position gets an equal share of deployable capital
+            alloc_percent = 1.0 / positions_remaining
 
         size = min(
-            available_capital * dynamic_percent,
+            deployable * alloc_percent,
             config.MAX_ABSOLUTE_POSITION_SOL,
         )
 

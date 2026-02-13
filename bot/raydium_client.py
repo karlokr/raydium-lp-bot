@@ -7,6 +7,7 @@ Uses the V3 mint-filtered endpoint which provides:
 - Proper mint objects with symbol/name/decimals
 - Paginated results (no 704k dead pool downloads)
 """
+import os
 import time
 import requests
 from typing import List, Dict, Optional
@@ -20,11 +21,85 @@ class RaydiumAPIClient:
     """Client for Raydium V3 API with caching and WSOL-pair filtering."""
 
     BASE_URL = "https://api-v3.raydium.io"
+    JUPITER_PRICE_URL = "https://api.jup.ag/price/v3"
+    COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 
     def __init__(self):
         self._cache: Optional[List[Dict]] = None
         self._cache_timestamp: float = 0
         self._cache_ttl = config.API_CACHE_TTL
+        self._sol_price_usd: float = 0.0
+        self._sol_price_timestamp: float = 0
+        self._sol_price_ttl: float = 60  # refresh every 60s
+        self._jupiter_api_key: str = os.getenv('JUPITER_API_KEY', '')
+
+    def get_sol_price_usd(self) -> float:
+        """Get current SOL/USD price.
+
+        Tries Jupiter Price API v3 first (requires JUPITER_API_KEY in .env).
+        Falls back to CoinGecko free API if Jupiter is unavailable.
+        Cached for 60 seconds. Returns last known price on failure.
+        """
+        current_time = time.time()
+        if self._sol_price_usd > 0 and current_time - self._sol_price_timestamp < self._sol_price_ttl:
+            return self._sol_price_usd
+
+        # Try Jupiter first (if API key is set)
+        if self._jupiter_api_key:
+            price = self._fetch_price_jupiter()
+            if price > 0:
+                self._sol_price_usd = price
+                self._sol_price_timestamp = current_time
+                return self._sol_price_usd
+
+        # Fallback to CoinGecko (no API key required)
+        price = self._fetch_price_coingecko()
+        if price > 0:
+            self._sol_price_usd = price
+            self._sol_price_timestamp = current_time
+            return self._sol_price_usd
+
+        # If both fail and no Jupiter key, try Jupiter without key as last resort
+        if not self._jupiter_api_key:
+            price = self._fetch_price_jupiter()
+            if price > 0:
+                self._sol_price_usd = price
+                self._sol_price_timestamp = current_time
+                return self._sol_price_usd
+
+        return self._sol_price_usd  # return last known price
+
+    def _fetch_price_jupiter(self) -> float:
+        """Fetch SOL/USD from Jupiter Price API v3."""
+        try:
+            headers = {}
+            if self._jupiter_api_key:
+                headers['x-api-key'] = self._jupiter_api_key
+            resp = requests.get(
+                self.JUPITER_PRICE_URL,
+                params={'ids': WSOL_MINT},
+                headers=headers,
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data.get(WSOL_MINT, {}).get('usdPrice', 0))
+        except Exception:
+            return 0.0
+
+    def _fetch_price_coingecko(self) -> float:
+        """Fetch SOL/USD from CoinGecko free API (no key required)."""
+        try:
+            resp = requests.get(
+                self.COINGECKO_PRICE_URL,
+                params={'ids': 'solana', 'vs_currencies': 'usd'},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data.get('solana', {}).get('usd', 0))
+        except Exception:
+            return 0.0
 
     def get_all_pools(self, force_refresh: bool = False) -> List[Dict]:
         """

@@ -37,7 +37,9 @@ class BotConfig:
     # Position Sizing
     MAX_ABSOLUTE_POSITION_SOL: float = 5.0  # Hard cap per position in SOL
     MAX_CONCURRENT_POSITIONS: int = 5  # Max active positions
-    RESERVE_PERCENT: float = 0.20  # Always keep 20% of capital in reserve
+    RESERVE_PERCENT: float = 0.20  # Always keep 20% of wallet balance in reserve
+    MIN_RESERVE_SOL: float = 0.05  # Absolute minimum SOL to keep (for tx fees)
+    POSITION_SIZE_PERCENT: float = 0.80  # Use 80% of deployable capital for best-ranked pool
 
     # Risk Management
     STOP_LOSS_PERCENT: float = -2.0  # Exit if down 2% (after fees/IL)
@@ -48,6 +50,7 @@ class BotConfig:
     # Trading Settings
     TRADING_ENABLED: bool = True  # Set to True to enable real transactions
     DRY_RUN: bool = False  # Paper trading mode
+    SLIPPAGE_PERCENT: float = 5.0  # Slippage tolerance (5% for volatile meme pools)
 
     # Monitoring
     POOL_SCAN_INTERVAL_SEC: int = 300  # Scan for new pools every 5 minutes

@@ -156,7 +156,16 @@ All settings in `bot/config.py`:
 |--------|----------|---------|
 | **Raydium V3 API** | `api-v3.raydium.io/pools/info/mint` | Pool discovery, TVL, APR, volume, burnPercent |
 | **RugCheck API** | `api.rugcheck.xyz/v1/tokens/{mint}/report` | Token safety scoring + risk analysis |
+| **Jupiter Price API** | `api.jup.ag/price/v3` | SOL/USD pricing (primary, needs `JUPITER_API_KEY`) |
+| **CoinGecko API** | `api.coingecko.com/api/v3/simple/price` | SOL/USD pricing (fallback, no key needed) |
 | **Solana RPC** | Configurable (Helius recommended) | Wallet balance, transaction submission |
+
+### SOL/USD Pricing
+
+The bot displays all values in both SOL and USD. Pricing uses a two-tier fallback:
+
+1. **Jupiter Price API v3** — Used when `JUPITER_API_KEY` is set in `.env`. Recommended for accuracy and rate limits.
+2. **CoinGecko free API** — Automatic fallback when no Jupiter key is configured. No API key required, but subject to CoinGecko's free-tier rate limits (~30 req/min).
 
 ### Raydium V3 vs V2
 
