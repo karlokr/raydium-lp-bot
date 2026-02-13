@@ -97,9 +97,6 @@ class PoolAnalyzer:
         ranked = sorted(scored_pools, key=lambda x: x['score'], reverse=True)
         return ranked[:top_n]
 
-    # Reserve SOL for ATA rent (3 accounts × ~0.00203) + transaction fees
-    ATA_RENT_RESERVE_SOL = 0.01
-
     def calculate_position_size(
         self,
         pool: Dict,
@@ -109,12 +106,11 @@ class PoolAnalyzer:
         """
         Calculate optimal position size in SOL.
 
-        Simple and robust: split available capital evenly across remaining
-        slots, after keeping a reserve. Higher-ranked pools naturally get
-        larger positions because they enter first when capital is highest.
+        Split available capital evenly across remaining slots after
+        keeping a small fixed reserve for transaction fees.
 
         Rules:
-        1. Reserve = max(available * RESERVE_PERCENT, MIN_RESERVE_SOL) + ATA rent
+        1. Reserve = RESERVE_SOL (fixed, e.g. 0.05 SOL)
         2. Size = deployable / positions_remaining
         3. Never exceed MAX_ABSOLUTE_POSITION_SOL
         """
@@ -122,14 +118,7 @@ class PoolAnalyzer:
         if positions_remaining <= 0:
             return 0.0
 
-        # Reserve: always keep enough for tx fees + future operations
-        reserve = max(
-            available_capital * config.RESERVE_PERCENT,
-            config.MIN_RESERVE_SOL,
-        )
-        reserve += self.ATA_RENT_RESERVE_SOL
-
-        deployable = available_capital - reserve
+        deployable = available_capital - config.RESERVE_SOL
         if deployable <= 0:
             return 0.0
 

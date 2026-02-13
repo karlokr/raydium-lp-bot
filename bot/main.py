@@ -369,14 +369,10 @@ class LiquidityBot:
             if not self.position_manager.can_open_position(self.available_capital):
                 break
 
-            # Enforce absolute minimum reserve before even trying
-            reserve_floor = max(
-                self.available_capital * config.RESERVE_PERCENT,
-                config.MIN_RESERVE_SOL,
-            )
-            if self.available_capital <= reserve_floor:
+            # Enforce minimum reserve before even trying
+            if self.available_capital <= config.RESERVE_SOL:
                 print(f"⚠ Available capital ({self.available_capital:.4f} SOL) at reserve floor "
-                      f"({reserve_floor:.4f} SOL) — not entering new positions")
+                      f"({config.RESERVE_SOL:.4f} SOL) — not entering new positions")
                 break
 
             if pool['score'] < 50:

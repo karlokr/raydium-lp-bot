@@ -37,9 +37,7 @@ class BotConfig:
     # Position Sizing
     MAX_ABSOLUTE_POSITION_SOL: float = 5.0  # Hard cap per position in SOL
     MAX_CONCURRENT_POSITIONS: int = 3  # Max active positions
-    RESERVE_PERCENT: float = 0.20  # Always keep 20% of wallet balance in reserve
-    MIN_RESERVE_SOL: float = 0.05  # Absolute minimum SOL to keep (for tx fees)
-    POSITION_SIZE_PERCENT: float = 0.80  # Use 80% of deployable capital for best-ranked pool
+    RESERVE_SOL: float = 0.05  # Fixed SOL reserve for tx fees + ATA rent
 
     # Risk Management
     STOP_LOSS_PERCENT: float = -4.0  # Exit if down 4% (after fees/IL)
