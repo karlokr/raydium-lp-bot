@@ -105,8 +105,8 @@ class RaydiumAPIClient:
         """
         Fetch WSOL pools from Raydium V3 API with caching.
 
-        Uses the mint-filtered endpoint to only fetch pools containing WSOL,
-        sorted by liquidity descending.
+        Queries by liquidity and by volume separately, merges and deduplicates.
+        This surfaces both deep-liquidity and high-activity pools.
 
         Returns normalized pool dicts with both V3 fields and backward-compatible aliases.
         """
@@ -131,42 +131,53 @@ class RaydiumAPIClient:
             return []
 
     def _fetch_wsol_pools(self) -> List[Dict]:
-        """Fetch all WSOL pools from V3 API with pagination."""
-        all_pools = []
-        page = 1
+        """Fetch WSOL pools from V3 API using multiple sort strategies.
 
-        while True:
-            url = (
-                f"{self.BASE_URL}/pools/info/mint"
-                f"?mint1={WSOL_MINT}"
-                f"&poolType=standard"
-                f"&poolSortField=liquidity"
-                f"&sortType=desc"
-                f"&pageSize=100"
-                f"&page={page}"
-            )
+        Queries by liquidity and by volume separately, then merges and
+        deduplicates. This surfaces both deep-liquidity pools and
+        high-activity pools that might rank lower by TVL alone.
+        """
+        seen_ids = set()
+        merged = []
 
-            response = requests.get(url, timeout=15)
-            response.raise_for_status()
-            data = response.json()
+        for sort_field in ('liquidity', 'volume'):
+            page = 1
+            while True:
+                url = (
+                    f"{self.BASE_URL}/pools/info/mint"
+                    f"?mint1={WSOL_MINT}"
+                    f"&poolType=standard"
+                    f"&poolSortField={sort_field}"
+                    f"&sortType=desc"
+                    f"&pageSize=100"
+                    f"&page={page}"
+                )
 
-            pools_data = data.get('data', {})
-            pools = pools_data.get('data', [])
+                response = requests.get(url, timeout=15)
+                response.raise_for_status()
+                data = response.json()
 
-            if not pools:
-                break
+                pools_data = data.get('data', {})
+                pools = pools_data.get('data', [])
 
-            for pool in pools:
-                all_pools.append(self._normalize_pool(pool))
+                if not pools:
+                    break
 
-            if not pools_data.get('hasNextPage', False):
-                break
+                for pool in pools:
+                    normalized = self._normalize_pool(pool)
+                    pool_id = normalized.get('ammId', '')
+                    if pool_id and pool_id not in seen_ids:
+                        seen_ids.add(pool_id)
+                        merged.append(normalized)
 
-            page += 1
-            if page > 10:  # Safety limit
-                break
+                if not pools_data.get('hasNextPage', False):
+                    break
 
-        return all_pools
+                page += 1
+                if page > 10:  # 1000 per sort field max
+                    break
+
+        return merged
 
     def _normalize_pool(self, pool: Dict) -> Dict:
         """
