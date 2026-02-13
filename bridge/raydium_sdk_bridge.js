@@ -685,8 +685,9 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
             const inputAta = inputToken.mint.equals(poolKeys.baseMint) ? baseAta : quoteAta;
             const acctInfo = await connection.getAccountInfo(inputAta);
             if (acctInfo) {
-                const decoded = SPL_ACCOUNT_LAYOUT.decode(acctInfo.data);
-                const rawBalance = new BN(decoded.amount.toString());
+                // Read amount directly from raw buffer (offset 64, u64 LE) to avoid
+                // SPL_ACCOUNT_LAYOUT.decode which can throw on >53 bit amounts
+                const rawBalance = new BN(acctInfo.data.readBigUInt64LE(64).toString());
                 if (rawBalance.isZero()) {
                     console.error('  Sell-all mode: token balance is 0, nothing to sell');
                     console.log(JSON.stringify({ success: true, signatures: [], note: 'No tokens to sell' }));
@@ -706,59 +707,46 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
         const slippagePercent = new Percent(Math.round(slippage * 100), 10000);
         console.error('  Amount raw: ' + amountInRaw.toString());
         
-        // Step 5: If input is WSOL, ensure we have enough native SOL
-        // The SDK creates a TEMPORARY wrapped SOL account from native SOL for swaps.
-        // It does NOT use the WSOL ATA. So we must unwrap any WSOL ATA balance
-        // back to native SOL first, then let the SDK handle wrapping internally.
+        // Step 5: Verify sufficient funds
         if (inputIsWsol) {
-            console.error('[5/7] Ensuring sufficient native SOL for SDK swap...');
-            const wsolAta = baseIsWsol ? baseAta : quoteAta;
-            
+            console.error('[5/7] Checking native SOL balance for swap...');
             const wrapLamports = BigInt(amountInRaw.toString());
-            const feesReserve = BigInt(5_000_000); // 0.005 SOL for tx fees + rent
-            const rentReserve = BigInt(2_039_280); // token account rent
-            const totalNeeded = wrapLamports + rentReserve + feesReserve;
+            const feesReserve = BigInt(5_000_000); // 0.005 SOL for tx fees
+            const totalNeeded = wrapLamports + feesReserve;
             
             const nativeBal = BigInt(await connection.getBalance(wallet.publicKey));
             console.error('  Native SOL: ' + nativeBal.toString() + ' lamports');
-            console.error('  SDK needs: ' + totalNeeded.toString() + ' lamports (amount + rent + fees)');
+            console.error('  Need: ' + totalNeeded.toString() + ' lamports (amount + fees)');
             
             if (nativeBal < totalNeeded) {
-                // Not enough native SOL — unwrap WSOL ATA to get more native SOL
+                // Try unwrapping WSOL ATA to free native SOL
+                const wsolAta = baseIsWsol ? baseAta : quoteAta;
                 const wsolAcctInfo = await connection.getAccountInfo(wsolAta);
                 if (wsolAcctInfo) {
-                    const decoded = SPL_ACCOUNT_LAYOUT.decode(wsolAcctInfo.data);
-                    const wsolBalance = BigInt(decoded.amount.toString());
-                    console.error('  WSOL in ATA: ' + wsolBalance.toString() + ' lamports');
-                    
-                    if (nativeBal + wsolBalance + rentReserve >= totalNeeded) {
-                        // Unwrap (close) the WSOL ATA — returns WSOL + rent to native SOL
-                        console.error('  Unwrapping WSOL ATA to get native SOL...');
+                    const wsolBalance = wsolAcctInfo.data.readBigUInt64LE(64);
+                    const rentRefund = BigInt(2_039_280);
+                    if (nativeBal + wsolBalance + rentRefund >= totalNeeded) {
+                        console.error('  Unwrapping WSOL ATA (' + wsolBalance.toString() + ' lamports)...');
                         const unwrapTx = new Transaction();
-                        unwrapTx.add(
-                            createCloseAccountInstruction(wsolAta, wallet.publicKey, wallet.publicKey)
-                        );
+                        unwrapTx.add(createCloseAccountInstruction(wsolAta, wallet.publicKey, wallet.publicKey));
                         const { blockhash: ub } = await connection.getLatestBlockhash();
                         unwrapTx.recentBlockhash = ub;
                         unwrapTx.feePayer = wallet.publicKey;
                         const unwrapSig = await connection.sendTransaction(unwrapTx, [wallet]);
                         await connection.confirmTransaction(unwrapSig, 'confirmed');
                         console.error('  WSOL unwrapped: ' + unwrapSig);
-                        
-                        const newNativeBal = await connection.getBalance(wallet.publicKey);
-                        console.error('  Native SOL after unwrap: ' + newNativeBal + ' lamports');
                     } else {
-                        const haveTotal = Number(nativeBal + wsolBalance) / 1e9;
-                        const needTotal = Number(totalNeeded) / 1e9;
-                        throw new Error('Insufficient funds. Have ' + haveTotal.toFixed(4) + ' SOL total but need ' + needTotal.toFixed(4) + ' SOL (amount + rent + fees).');
+                        const have = Number(nativeBal + wsolBalance) / 1e9;
+                        const need = Number(totalNeeded) / 1e9;
+                        throw new Error('Insufficient funds. Have ' + have.toFixed(4) + ' SOL total but need ' + need.toFixed(4) + ' SOL');
                     }
                 } else {
-                    const haveSOL = (Number(nativeBal) / 1e9).toFixed(4);
-                    const needSOL = (Number(totalNeeded) / 1e9).toFixed(4);
-                    throw new Error('Insufficient native SOL. Have ' + haveSOL + ' SOL but need ' + needSOL + ' SOL and no WSOL ATA to unwrap.');
+                    const have = (Number(nativeBal) / 1e9).toFixed(4);
+                    const need = (Number(totalNeeded) / 1e9).toFixed(4);
+                    throw new Error('Insufficient native SOL. Have ' + have + ' SOL but need ' + need + ' SOL');
                 }
             } else {
-                console.error('  Native SOL is sufficient, no unwrap needed');
+                console.error('  Sufficient native SOL');
             }
         } else {
             console.error('[5/7] Input is not WSOL, skipping wrap');
@@ -769,8 +757,8 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
             if (!inputAcctInfo) {
                 throw new Error('Input token account does not exist: ' + inputAta.toString());
             }
-            const decoded = SPL_ACCOUNT_LAYOUT.decode(inputAcctInfo.data);
-            const inputBalance = new BN(decoded.amount.toString());
+            // Read amount from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
+            const inputBalance = new BN(inputAcctInfo.data.readBigUInt64LE(64).toString());
             console.error('  Input token balance: ' + inputBalance.toString() + ' raw');
             if (inputBalance.lt(amountInRaw)) {
                 throw new Error('Insufficient input token balance. Have ' + inputBalance.toString() + ' but need ' + amountInRaw.toString());
@@ -782,6 +770,11 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
         
         // Read vault balances + OpenOrders to compute effective reserves
         // (matches what the AMM program uses internally)
+        //
+        // IMPORTANT: Read vault amounts from raw buffer using BigInt, NOT via
+        // SPL_ACCOUNT_LAYOUT.decode. The SDK's layout decoder calls BN.toNumber()
+        // on the u64 amount field, which throws "Number can only safely store up
+        // to 53 bits" when a vault holds >9M tokens at 9 decimals.
         const [baseVaultInfo, quoteVaultInfo, openOrdersInfo, lpMintInfo] = await Promise.all([
             connection.getAccountInfo(poolKeys.baseVault),
             connection.getAccountInfo(poolKeys.quoteVault),
@@ -791,10 +784,9 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
         if (!baseVaultInfo || !quoteVaultInfo) {
             throw new Error('Could not read vault accounts for pool reserves');
         }
-        const baseVaultDecoded = SPL_ACCOUNT_LAYOUT.decode(baseVaultInfo.data);
-        const quoteVaultDecoded = SPL_ACCOUNT_LAYOUT.decode(quoteVaultInfo.data);
-        const baseVaultAmount = new BN(baseVaultDecoded.amount.toString());
-        const quoteVaultAmount = new BN(quoteVaultDecoded.amount.toString());
+        // SPL Token account layout: amount is a u64 LE at offset 64
+        const baseVaultAmount = new BN(baseVaultInfo.data.readBigUInt64LE(64).toString());
+        const quoteVaultAmount = new BN(quoteVaultInfo.data.readBigUInt64LE(64).toString());
         
         // Add OpenOrders totals for effective reserves
         let openOrdersBaseTotal = new BN(0);
@@ -894,20 +886,49 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
             fixedSide: 'in',
         });
         
-        // Step 7: Send transactions
-        console.error('[7/7] Sending swap transaction(s)...');
+        // Step 7: Build and send transaction
+        // makeSwapInstruction (non-Simple) does NOT handle WSOL wrapping.
+        // We must manually wrap SOL → WSOL before the swap (buy direction)
+        // and unwrap WSOL → SOL after the swap (sell direction).
+        console.error('[7/7] Building and sending swap transaction...');
         const txids = [];
         
         // makeSwapInstruction returns { innerTransaction } with instructions + signers
         const innerTx = swapIxs.innerTransaction || swapIxs;
-        const instructions = innerTx.instructions || [];
+        const swapInstructions = innerTx.instructions || [];
         
-        if (instructions.length === 0) {
+        if (swapInstructions.length === 0) {
             throw new Error('makeSwapInstruction returned no instructions');
         }
         
         const tx = new Transaction();
-        tx.add(...instructions);
+        const wsolAta = baseIsWsol ? baseAta : quoteAta;
+        
+        // Pre-swap: if buying with SOL, wrap native SOL into WSOL ATA
+        if (inputIsWsol) {
+            console.error('  Wrapping ' + amountInRaw.toString() + ' lamports into WSOL ATA...');
+            // WSOL ATA already exists (created by getOrCreateTokenAccount above).
+            // Transfer SOL into the WSOL ATA and sync to update its balance.
+            tx.add(
+                SystemProgram.transfer({
+                    fromPubkey: wallet.publicKey,
+                    toPubkey: wsolAta,
+                    lamports: BigInt(amountInRaw.toString()),
+                })
+            );
+            // Sync native — makes the ATA reflect the transferred SOL as WSOL balance
+            tx.add(createSyncNativeInstruction(wsolAta));
+        }
+        
+        // Add the actual swap instruction(s)
+        tx.add(...swapInstructions);
+        
+        // Post-swap: unwrap WSOL ATA back to native SOL
+        // For buys: close WSOL ATA to reclaim any dust + rent
+        // For sells: close WSOL ATA to convert received WSOL to native SOL
+        tx.add(
+            createCloseAccountInstruction(wsolAta, wallet.publicKey, wallet.publicKey)
+        );
         
         const { blockhash } = await connection.getLatestBlockhash();
         tx.recentBlockhash = blockhash;
@@ -923,36 +944,12 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
         txids.push(signature);
         console.error('  Swap confirmed: ' + signature);
         
-        // Unwrap any remaining WSOL ATA balance back to native SOL after sell
-        const outputIsWsol = outputToken.mint.equals(WSOL_MINT);
-        if (outputIsWsol) {
-            const wsolAta = baseIsWsol ? baseAta : quoteAta;
-            const wsolAcctInfo = await connection.getAccountInfo(wsolAta);
-            if (wsolAcctInfo) {
-                const decoded = SPL_ACCOUNT_LAYOUT.decode(wsolAcctInfo.data);
-                const remaining = BigInt(decoded.amount.toString());
-                console.error('  WSOL ATA has ' + remaining.toString() + ' lamports remaining, unwrapping...');
-                const unwrapTx = new Transaction();
-                unwrapTx.add(
-                    createCloseAccountInstruction(wsolAta, wallet.publicKey, wallet.publicKey)
-                );
-                const { blockhash: unwrapBlockhash } = await connection.getLatestBlockhash();
-                unwrapTx.recentBlockhash = unwrapBlockhash;
-                unwrapTx.feePayer = wallet.publicKey;
-                const unwrapSig = await connection.sendTransaction(unwrapTx, [wallet]);
-                await connection.confirmTransaction(unwrapSig, 'confirmed');
-                console.error('  WSOL unwrapped: ' + unwrapSig);
-            } else {
-                console.error('  No WSOL ATA to unwrap (SDK handled it via temp account)');
-            }
-        }
-        
         console.error('=== SWAP SUCCESS ===');
         console.log(JSON.stringify({
             success: true,
             signatures: txids,
-            amountOut: amountOut.toFixed(),
-            minAmountOut: minAmountOut.toFixed(),
+            amountOut: amountOut.raw.toString(),
+            minAmountOut: minAmountOut.raw.toString(),
         }));
         
     } catch (err) {
