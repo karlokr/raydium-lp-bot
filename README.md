@@ -4,18 +4,6 @@
 
 Autonomously discovers, evaluates, and provides liquidity to high-yield Raydium pools — then actively manages positions to farm trading fees while protecting against rug pulls and impermanent loss. No other open-source tool on Solana does this.
 
-Automated Solana liquidity pool bot that discovers, scores, and trades WSOL pairs on Raydium DEX.
-
-### What makes this different
-
-| Category | Existing Solana bots | This bot |
-|---|---|---|
-| **Strategy** | Snipe tokens, copy trades, rug pools | Provide liquidity, earn trading fees |
-| **Pool selection** | Hardcoded single pair or manual | Autonomous discovery + 5-factor scoring across all WSOL pairs |
-| **Safety** | None or basic | RugCheck + on-chain LP lock analysis + holder concentration checks |
-| **Risk management** | Buy and pray | Stop-loss, take-profit, IL monitoring, time-based exits |
-| **Revenue model** | Price speculation (buy low / sell high) | Fee farming (earn 0.25% of every trade through your pool) |
-
 ## Features
 
 - **Raydium V3 API** — Paginated, mint-filtered pool discovery (WSOL pairs only)
