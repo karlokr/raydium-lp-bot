@@ -2,7 +2,7 @@
 
 **The first open-source LP fee farming bot for Solana.**
 
-Every other Solana "LP bot" on GitHub is a sniper (buy token fast), a bundler (launch + rug), or a volume faker. This is the first bot that autonomously discovers, evaluates, and provides liquidity to high-yield Raydium pools — then actively manages positions to farm trading fees while protecting against rug pulls and impermanent loss.
+Autonomously discovers, evaluates, and provides liquidity to high-yield Raydium pools — then actively manages positions to farm trading fees while protecting against rug pulls and impermanent loss. No other open-source tool on Solana does this.
 
 Automated Solana liquidity pool bot that discovers, scores, and trades WSOL pairs on Raydium DEX.
 
