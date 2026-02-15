@@ -43,6 +43,7 @@ class LiquidityBot:
         self._failed_pools = set()  # Track pools that failed to avoid retrying
         self._exit_cooldowns: dict = {}  # amm_id -> timestamp of loss exit (cooldown)
         self._last_scan_pools: list = []  # Top-ranked pools from last scan
+        self._last_balance_refresh = 0.0  # Timestamp of last RPC balance read
 
         # Restore state from disk FIRST — positions must be known
         # before LP recovery so we don't accidentally exit them
@@ -52,7 +53,8 @@ class LiquidityBot:
         #   1. Unwrap WSOL → native SOL
         #   2. Auto-close ghost positions (LP=0 on-chain)
         #   3. Recover leftover LP tokens (orphans from previous runs)
-        #   4. Close empty token accounts → reclaim rent
+        #   4. Sell leftover non-SOL tokens (from failed exit swaps)
+        #   5. Close empty token accounts → reclaim rent
         if self.executor and not config.DRY_RUN:
             wsol = self.executor.get_wsol_balance()
             if wsol > 0.001:
@@ -68,6 +70,9 @@ class LiquidityBot:
             # (skips LP mints belonging to restored positions)
             self._recover_leftover_lp_tokens()
 
+            # Sell any leftover non-SOL tokens (e.g. from failed exit swaps)
+            self._sweep_leftover_tokens()
+
             # Close empty token accounts to reclaim rent
             keep_mints = [pos.lp_mint for pos in self.position_manager.active_positions.values() if pos.lp_mint]
             result = self.executor.close_empty_accounts(keep_mints=keep_mints)
@@ -77,7 +82,7 @@ class LiquidityBot:
 
         # Capital is always the current wallet balance
         self.available_capital = 0.0  # in SOL
-        self._refresh_balance()
+        self._refresh_balance(force=True)
 
         sol_price = self.api_client.get_sol_price_usd()
 
@@ -98,17 +103,21 @@ class LiquidityBot:
         print(f"Min LP Burn: {config.MIN_BURN_PERCENT}%")
         print("=" * 60)
 
-    def _refresh_balance(self):
+    def _refresh_balance(self, force: bool = False):
         """Refresh available capital from native SOL balance.
         
-        WSOL is unwrapped at startup, and the SDK uses native SOL
-        directly for all operations (creates temp WSOL accounts internally).
+        Throttled to at most once per 60 seconds unless force=True.
+        Entry/exit paths pass force=True to get an immediate read.
         """
         if self.executor and not config.DRY_RUN:
+            now = time.time()
+            if not force and (now - self._last_balance_refresh) < 60:
+                return  # recent enough, skip RPC call
             new_balance = self.executor.get_balance()
             if abs(new_balance - self.available_capital) > 0.0001:
                 print(f"💰 Wallet balance: {new_balance:.4f} SOL")
             self.available_capital = new_balance
+            self._last_balance_refresh = now
         elif config.DRY_RUN:
             if self.available_capital == 0.0:
                 self.available_capital = 1.0
@@ -187,16 +196,22 @@ class LiquidityBot:
         print(f"\n🧹 Found {len(ghosts)} ghost position(s) (LP=0 on-chain) — cleaning up...")
         for amm_id, pos in ghosts:
             print(f"  🔄 Cleaning ghost: {pos.pool_name}")
-            # Try to swap any remaining non-SOL tokens back
-            try:
-                self.executor.swap_tokens(
-                    pool_id=amm_id,
-                    amount_in=0,  # sell-all
-                    direction='sell',
-                )
-                time.sleep(2)
-            except Exception:
-                pass
+            # Try to swap any remaining non-SOL tokens back (retry up to 3x)
+            token_name = pos.pool_name.replace('WSOL/', '').replace('/WSOL', '')
+            for attempt, delay in enumerate([0, 3, 5], 1):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    sig = self.executor.swap_tokens(
+                        pool_id=amm_id,
+                        amount_in=0,  # sell-all
+                        direction='sell',
+                    )
+                    if sig:
+                        time.sleep(2)
+                        break
+                except Exception:
+                    pass
 
             sol_price = self.api_client.get_sol_price_usd()
             state.append_trade_history(pos, "Ghost cleanup (startup)", sol_price_usd=sol_price)
@@ -249,13 +264,15 @@ class LiquidityBot:
                 if resp.status_code != 200:
                     continue
                 data = resp.json().get('data', [])
-                for pool in data:
+                for pool in (data or []):
+                    if not pool or not isinstance(pool, dict):
+                        continue
                     pool_id = pool.get('id', '')
-                    lp_mint_info = pool.get('lpMint', {})
+                    lp_mint_info = pool.get('lpMint') or {}
                     lp_mint_addr = lp_mint_info.get('address', '')
                     lp_decimals = lp_mint_info.get('decimals', 9)
-                    mint_a = pool.get('mintA', {})
-                    mint_b = pool.get('mintB', {})
+                    mint_a = pool.get('mintA') or {}
+                    mint_b = pool.get('mintB') or {}
                     pool_name = f"{mint_a.get('symbol', '?')}/{mint_b.get('symbol', '?')}"
                     if pool_id and lp_mint_addr:
                         lp_positions.append({
@@ -300,10 +317,19 @@ class LiquidityBot:
 
                 time.sleep(3)
 
-                # Swap remaining tokens back to SOL
+                # Swap remaining tokens back to SOL — retry on transient RPC failures
                 token_name = name.replace('WSOL/', '').replace('/WSOL', '')
-                print(f"🔄 Swapping all {token_name} → SOL...")
-                self.executor.swap_tokens(pool_id=pool_id, amount_in=0, direction='sell')
+                swap_ok = False
+                for attempt, delay in enumerate([0, 3, 5], 1):
+                    if delay:
+                        time.sleep(delay)
+                    print(f"🔄 Swapping all {token_name} → SOL..." + (f" (attempt {attempt}/3)" if attempt > 1 else ""))
+                    swap_sig = self.executor.swap_tokens(pool_id=pool_id, amount_in=0, direction='sell')
+                    if swap_sig:
+                        swap_ok = True
+                        break
+                if not swap_ok:
+                    print(f"  ⚠ Could not sell {token_name} after 3 attempts — will retry via token sweep")
 
                 time.sleep(2)
 
@@ -320,6 +346,79 @@ class LiquidityBot:
         print(f"{'=' * 60}")
         print(f"✓ LP recovery complete")
         print(f"{'=' * 60}\n")
+
+    def _sweep_leftover_tokens(self):
+        """Sell any non-SOL, non-LP tokens left in the wallet.
+
+        This catches tokens stranded by failed exit swaps.  For each token
+        we query the Raydium API to find a WSOL pool and sell-all through it.
+        """
+        if not self.executor:
+            return
+
+        # Mints to skip: SOL/WSOL + LP mints of active positions
+        wsol_mint = "So11111111111111111111111111111111111111112"
+        skip_mints = {wsol_mint}
+        for pos in self.position_manager.active_positions.values():
+            if pos.lp_mint:
+                skip_mints.add(pos.lp_mint)
+
+        all_tokens = self.executor.list_all_tokens()
+        if not all_tokens:
+            return
+
+        leftover = [t for t in all_tokens
+                     if t['mint'] not in skip_mints
+                     and int(t.get('balance', 0)) > 0]
+        if not leftover:
+            return
+
+        # Try to find WSOL pools for these mints via Raydium API
+        print(f"🧹 Found {len(leftover)} leftover token(s) — attempting to sell back to SOL...")
+        for tok in leftover:
+            mint = tok['mint']
+            try:
+                url = (f"{self.api_client.BASE_URL}/pools/info/mint"
+                       f"?mint1={wsol_mint}&mint2={mint}"
+                       f"&poolType=standard&poolSortField=liquidity"
+                       f"&sortType=desc&pageSize=1&page=1")
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 200:
+                    print(f"  ⚠ Could not look up pool for {mint[:8]}...")
+                    continue
+
+                pools_data = resp.json().get('data', {})
+                pools = pools_data.get('data', []) if isinstance(pools_data, dict) else []
+                if not pools:
+                    print(f"  ⚠ No WSOL pool found for {mint[:8]}...")
+                    continue
+
+                pool = pools[0]
+                pool_id = pool.get('id', '')
+                pool_name = f"{(pool.get('mintA') or {}).get('symbol', '?')}/{(pool.get('mintB') or {}).get('symbol', '?')}"
+                if not pool_id:
+                    continue
+
+                # Only use V4 AMM pools (our bridge only supports this program)
+                program = pool.get('programId', '')
+                if program and program != '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8':
+                    print(f"  ⚠ Pool for {mint[:8]}... is not AMM V4 — skipping")
+                    continue
+
+                print(f"  🔄 Selling leftover {pool_name} tokens → SOL...")
+                sig = self.executor.swap_tokens(
+                    pool_id=pool_id,
+                    amount_in=0,  # sell-all
+                    direction='sell',
+                )
+                if sig:
+                    print(f"  ✓ Sold {pool_name}")
+                    time.sleep(2)
+                else:
+                    print(f"  ✗ Failed to sell {pool_name}")
+
+            except Exception as e:
+                print(f"  ✗ Error selling token {mint[:8]}...: {e}")
 
     def scan_and_rank_pools(self) -> list:
         """Scan for pools and rank them."""
@@ -392,10 +491,6 @@ class LiquidityBot:
         ghost_positions = []  # positions whose LP tokens are gone on-chain
 
         for amm_id, pos in self.position_manager.active_positions.items():
-            pool = self.api_client.get_pool_by_id(amm_id)
-            if pool:
-                pools_data[amm_id] = pool
-
             # Get on-chain LP value + real-time price from reserves
             if pos.lp_mint and self.executor:
                 data = self.executor.get_lp_value_sol(amm_id, pos.lp_mint)
@@ -429,7 +524,7 @@ class LiquidityBot:
                 self._save_state()
 
         if ghost_positions:
-            self._refresh_balance()  # Wallet view changed after removing ghosts
+            self._refresh_balance(force=True)  # Wallet view changed after removing ghosts
 
         # Update each position — prefer on-chain price, fall back to API
         for amm_id, position in list(self.position_manager.active_positions.items()):
@@ -439,6 +534,11 @@ class LiquidityBot:
 
             # Fall back to API price only if on-chain price unavailable
             if current_price <= 0:
+                # Only fetch pool from API when we actually need it (rare fallback)
+                if amm_id not in pools_data:
+                    pool = self.api_client.get_pool_by_id(amm_id)
+                    if pool:
+                        pools_data[amm_id] = pool
                 current_price = self.price_tracker.get_current_price(
                     amm_id, pools_data.get(amm_id)
                 )
@@ -495,15 +595,25 @@ class LiquidityBot:
                 print(f"⚠ No LP tokens found for {position.pool_name}")
 
             # Step 2: Swap all remaining non-SOL tokens back to SOL
+            # Retry up to 3 times — RPC failures here leave tokens stuck in wallet
             import time as _time
             _time.sleep(2)
             token_name = position.pool_name.replace('WSOL/', '').replace('/WSOL', '')
-            print(f"🔄 Swapping all {token_name} → SOL...")
-            self.executor.swap_tokens(
-                pool_id=amm_id,
-                amount_in=0,  # sell-all mode
-                direction='sell',
-            )
+            swap_ok = False
+            for attempt, delay in enumerate([0, 3, 5], 1):
+                if delay:
+                    _time.sleep(delay)
+                print(f"🔄 Swapping all {token_name} → SOL..." + (f" (attempt {attempt}/3)" if attempt > 1 else ""))
+                sig = self.executor.swap_tokens(
+                    pool_id=amm_id,
+                    amount_in=0,  # sell-all mode
+                    direction='sell',
+                )
+                if sig:
+                    swap_ok = True
+                    break
+            if not swap_ok:
+                print(f"⚠ Could not sell {token_name} after 3 attempts — tokens may be stuck in wallet")
 
         sol_price = self.api_client.get_sol_price_usd()
 
@@ -515,7 +625,7 @@ class LiquidityBot:
             amm_id, reason, sol_price_usd=sol_price
         )
         if success:
-            self._refresh_balance()
+            self._refresh_balance(force=True)
             # Clean up snapshot history for this pool
             self.snapshot_tracker.clear_pool(amm_id)
             # Cooldown: don't re-enter pools we exited at a loss
@@ -536,7 +646,7 @@ class LiquidityBot:
     def look_for_new_entries(self, top_pools: list):
         """Look for new entry opportunities. Pools are already sorted by score (best first).
         Position sizes are pre-computed from the initial balance so they're equal."""
-        self._refresh_balance()
+        self._refresh_balance(force=True)
 
         if not self.position_manager.can_open_position(self.available_capital):
             return
@@ -628,7 +738,7 @@ class LiquidityBot:
                     print(f"✗ Swap failed - removing position, trying next pool")
                     self.position_manager.close_position(amm_id)
                     self._failed_pools.add(amm_id)
-                    self._refresh_balance()
+                    self._refresh_balance(force=True)
                     continue
 
                 # Brief delay for on-chain state to settle
@@ -652,7 +762,7 @@ class LiquidityBot:
                     )
                     self.position_manager.close_position(amm_id)
                     self._failed_pools.add(amm_id)
-                    self._refresh_balance()
+                    self._refresh_balance(force=True)
                     continue
 
                 position.pool_data['entry_signature'] = add_result['signature']
@@ -687,12 +797,12 @@ class LiquidityBot:
                         )
                         self.position_manager.close_position(amm_id)
                         self._failed_pools.add(amm_id)
-                        self._refresh_balance()
+                        self._refresh_balance(force=True)
                         continue
 
             # Track committed capital ourselves — don't trust RPC balance
             committed += position.position_size_sol
-            self._refresh_balance()
+            self._refresh_balance(force=True)
             self._save_state()
 
     @staticmethod
@@ -704,7 +814,7 @@ class LiquidityBot:
 
     def print_status(self):
         """Print bot status."""
-        self._refresh_balance()  # Always show fresh on-chain balance
+        self._refresh_balance()  # Throttled: at most once per 60s
         summary = self.position_manager.get_summary()
         sol_price = self.api_client.get_sol_price_usd()
 
@@ -917,7 +1027,7 @@ class LiquidityBot:
 
         # Wait for on-chain state to settle before reading balance
         time.sleep(3)
-        self._refresh_balance()
+        self._refresh_balance(force=True)
         print(f"\n  ✓ Closed {closed} position(s)  |  Balance: {self._usd(self.available_capital, sol_price)}\n")
 
     def run(self):

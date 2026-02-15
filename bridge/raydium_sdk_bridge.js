@@ -67,6 +67,34 @@ connection._rpcBatchRequest = async function(requests) {
 };
 let wallet;
 
+/**
+ * Retry wrapper for RPC calls that can fail with transient network errors
+ * (e.g. "TypeError: fetch failed" from the Helius endpoint).
+ * Retries up to `maxRetries` times with exponential backoff.
+ */
+async function rpcRetry(fn, label = 'RPC call', maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            const msg = err?.message || String(err);
+            const isTransient = msg.includes('fetch failed') ||
+                                msg.includes('FetchError') ||
+                                msg.includes('ECONNRESET') ||
+                                msg.includes('ETIMEDOUT') ||
+                                msg.includes('socket hang up') ||
+                                msg.includes('503') ||
+                                msg.includes('429');
+            if (!isTransient || attempt === maxRetries) {
+                throw err;
+            }
+            const delay = attempt * 2000;  // 2s, 4s, 6s
+            console.error(`[RPC] ${label} failed (attempt ${attempt}/${maxRetries}): ${msg} — retrying in ${delay}ms...`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+}
+
 if (PRIVATE_KEY) {
     try {
         let secretKey;
@@ -98,7 +126,10 @@ async function fetchPoolKeys(poolId) {
     
     // Step 1: Read AMM account on-chain
     console.error('Fetching AMM account: ' + poolId);
-    const ammAccountInfo = await connection.getAccountInfo(poolPubkey);
+    const ammAccountInfo = await rpcRetry(
+        () => connection.getAccountInfo(poolPubkey),
+        'getAccountInfo(AMM ' + poolId.slice(0, 8) + ')'
+    );
     if (!ammAccountInfo) {
         throw new Error('AMM account ' + poolId + ' not found on-chain');
     }
@@ -129,7 +160,10 @@ async function fetchPoolKeys(poolId) {
     const marketProgramId = ammState.marketProgramId;
     
     console.error('Fetching Market account: ' + marketId.toString());
-    const marketAccountInfo = await connection.getAccountInfo(marketId);
+    const marketAccountInfo = await rpcRetry(
+        () => connection.getAccountInfo(marketId),
+        'getAccountInfo(Market ' + marketId.toString().slice(0, 8) + ')'
+    );
     if (!marketAccountInfo) {
         throw new Error('Market account ' + marketId.toString() + ' not found on-chain');
     }
@@ -291,12 +325,15 @@ async function addLiquidity(poolId, amountA, amountB, slippage) {
         // Read pool vaults AND OpenOrders account to compute effective reserves.
         // The AMM on-chain uses: effectiveReserve = vaultAmount + openOrdersTotal
         // Using only vault amounts causes 0x1e slippage because the ratio is wrong.
-        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo, lpMintInfo] = await Promise.all([
-            connection.getAccountInfo(poolKeys.baseVault),
-            connection.getAccountInfo(poolKeys.quoteVault),
-            connection.getAccountInfo(poolKeys.openOrders),
-            connection.getAccountInfo(poolKeys.lpMint),
-        ]);
+        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo, lpMintInfo] = await rpcRetry(
+            () => Promise.all([
+                connection.getAccountInfo(poolKeys.baseVault),
+                connection.getAccountInfo(poolKeys.quoteVault),
+                connection.getAccountInfo(poolKeys.openOrders),
+                connection.getAccountInfo(poolKeys.lpMint),
+            ]),
+            'getAccountInfo(vaults+openOrders) for addLiquidity'
+        );
         if (!baseVaultInfo || !quoteVaultInfo) {
             throw new Error('Could not read pool vault accounts');
         }
@@ -388,16 +425,17 @@ async function addLiquidity(poolId, amountA, amountB, slippage) {
         console.error('Slippage: ' + slippage + '%');
         
         // Ensure enough native SOL for the SDK's temp WSOL account
-        const wsolAmountRaw = baseIsWsol ? amountInA.raw : amountInB.raw;
+        let wsolAmountRaw = baseIsWsol ? amountInA.raw : amountInB.raw;
         const wsolAta = baseIsWsol ? baseAta : quoteAta;
-        const wrapLamports = BigInt(wsolAmountRaw.toString());
+        let wrapLamports = BigInt(wsolAmountRaw.toString());
         const overhead = BigInt(7_000_000); // rent + fees
-        const totalNeeded = wrapLamports + overhead;
-        const nativeBal = BigInt(await connection.getBalance(wallet.publicKey));
+        let totalNeeded = wrapLamports + overhead;
+        let nativeBal = BigInt(await connection.getBalance(wallet.publicKey));
         
         console.error('SDK needs ' + totalNeeded.toString() + ' native lamports, have ' + nativeBal.toString());
         
         if (nativeBal < totalNeeded) {
+            // Try unwrapping any existing WSOL first
             const wsolAcctInfo = await connection.getAccountInfo(wsolAta);
             if (wsolAcctInfo) {
                 const wsolBalance = wsolAcctInfo.data.readBigUInt64LE(64);
@@ -410,6 +448,44 @@ async function addLiquidity(poolId, amountA, amountB, slippage) {
                 const us = await connection.sendTransaction(unwrapTx, [wallet]);
                 await connection.confirmTransaction(us, 'confirmed');
                 console.error('WSOL unwrapped: ' + us);
+                nativeBal = BigInt(await connection.getBalance(wallet.publicKey));
+            }
+            
+            // If still insufficient, re-fix on the SOL side instead of the token side.
+            // This happens when the wallet holds leftover tokens from a failed exit swap,
+            // making the total token balance larger than what this entry intended.
+            if (nativeBal < totalNeeded) {
+                console.error('Still insufficient SOL after unwrap (' + nativeBal.toString() + ' < ' + totalNeeded.toString() + ')');
+                console.error('Re-computing: fixing on SOL side to match available balance...');
+                
+                const usableLamports = nativeBal - overhead;
+                if (usableLamports <= BigInt(0)) {
+                    throw new Error('Not enough SOL for add liquidity (need ' + totalNeeded.toString() + ' lamports, have ' + nativeBal.toString() + ')');
+                }
+                
+                const solToken = baseIsWsol ? baseToken : quoteToken;
+                const solFixedAmount = new TokenAmount(solToken, new BN(usableLamports.toString()), true);
+                const solFixedSide = baseIsWsol ? 'a' : 'b';
+                
+                const recomputed = Liquidity.computeAnotherAmount({
+                    poolKeys,
+                    poolInfo,
+                    amount: solFixedAmount,
+                    anotherCurrency: baseIsWsol ? quoteToken : baseToken,
+                    slippage: slippagePercent,
+                });
+                
+                if (baseIsWsol) {
+                    amountInA = solFixedAmount;            // SOL (capped to what we have)
+                    amountInB = recomputed.maxAnotherAmount;  // token (computed from SOL)
+                    fixedSide = 'a';
+                } else {
+                    amountInA = recomputed.maxAnotherAmount;  // token (computed from SOL)
+                    amountInB = solFixedAmount;            // SOL (capped to what we have)
+                    fixedSide = 'b';
+                }
+                
+                console.error('Recomputed - amountInA: ' + amountInA.raw.toString() + ', amountInB: ' + amountInB.raw.toString() + ', fixedSide: ' + fixedSide);
             }
         }
         
@@ -792,12 +868,15 @@ async function swapTokens(poolId, amountIn, slippage, direction) {
         // SPL_ACCOUNT_LAYOUT.decode. The SDK's layout decoder calls BN.toNumber()
         // on the u64 amount field, which throws "Number can only safely store up
         // to 53 bits" when a vault holds >9M tokens at 9 decimals.
-        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo, lpMintInfo] = await Promise.all([
-            connection.getAccountInfo(poolKeys.baseVault),
-            connection.getAccountInfo(poolKeys.quoteVault),
-            connection.getAccountInfo(poolKeys.openOrders),
-            connection.getAccountInfo(poolKeys.lpMint),
-        ]);
+        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo, lpMintInfo] = await rpcRetry(
+            () => Promise.all([
+                connection.getAccountInfo(poolKeys.baseVault),
+                connection.getAccountInfo(poolKeys.quoteVault),
+                connection.getAccountInfo(poolKeys.openOrders),
+                connection.getAccountInfo(poolKeys.lpMint),
+            ]),
+            'getAccountInfo(vaults+openOrders) for swap'
+        );
         if (!baseVaultInfo || !quoteVaultInfo) {
             throw new Error('Could not read vault accounts for pool reserves');
         }
@@ -1032,7 +1111,10 @@ async function getLpValue(poolId, lpMint) {
         // Read LP token balance
         const lpMintPubkey = new PublicKey(lpMint);
         const lpAta = await getAssociatedTokenAddress(lpMintPubkey, wallet.publicKey);
-        const lpAcctInfo = await connection.getAccountInfo(lpAta);
+        const lpAcctInfo = await rpcRetry(
+            () => connection.getAccountInfo(lpAta),
+            'getAccountInfo(LP ATA)'
+        );
         if (!lpAcctInfo) {
             console.log(JSON.stringify({ valueSol: 0, lpBalance: 0 }));
             return;
@@ -1046,11 +1128,14 @@ async function getLpValue(poolId, lpMint) {
         }
         
         // Read pool reserves + OpenOrders
-        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo] = await Promise.all([
-            connection.getAccountInfo(poolKeys.baseVault),
-            connection.getAccountInfo(poolKeys.quoteVault),
-            connection.getAccountInfo(poolKeys.openOrders),
-        ]);
+        const [baseVaultInfo, quoteVaultInfo, openOrdersInfo] = await rpcRetry(
+            () => Promise.all([
+                connection.getAccountInfo(poolKeys.baseVault),
+                connection.getAccountInfo(poolKeys.quoteVault),
+                connection.getAccountInfo(poolKeys.openOrders),
+            ]),
+            'getAccountInfo(vaults+openOrders) for lpvalue'
+        );
         
         // Read amounts from raw buffer (offset 64, u64 LE) to avoid 53-bit overflow
         const baseVault = new BN(baseVaultInfo.data.readBigUInt64LE(64).toString());
