@@ -428,6 +428,9 @@ class LiquidityBot:
                 self.position_manager.close_position(amm_id, "Ghost cleanup")
                 self._save_state()
 
+        if ghost_positions:
+            self._refresh_balance()  # Wallet view changed after removing ghosts
+
         # Update each position — prefer on-chain price, fall back to API
         for amm_id, position in list(self.position_manager.active_positions.items()):
             chain = on_chain_data.get(amm_id, {})
@@ -701,6 +704,7 @@ class LiquidityBot:
 
     def print_status(self):
         """Print bot status."""
+        self._refresh_balance()  # Always show fresh on-chain balance
         summary = self.position_manager.get_summary()
         sol_price = self.api_client.get_sol_price_usd()
 
