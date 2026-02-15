@@ -128,6 +128,35 @@ class RaydiumExecutor:
             print(f"Error getting token balance: {e}")
             return 0.0
 
+    def close_empty_accounts(self, keep_mints: list = None) -> dict:
+        """Close all empty token accounts to reclaim rent SOL.
+        
+        Args:
+            keep_mints: Optional list of mint addresses to keep (even if empty).
+        Returns dict with 'closed' (int) and 'reclaimedSol' (float).
+        """
+        try:
+            args = ['node', config.BRIDGE_SCRIPT, 'closeaccounts']
+            if keep_mints:
+                args.append(','.join(keep_mints))
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=os.environ.copy(),
+            )
+            if result.returncode != 0:
+                return {'closed': 0, 'reclaimedSol': 0}
+            response = json.loads(result.stdout.strip().split('\n')[-1])
+            return {
+                'closed': int(response.get('closed', 0)),
+                'reclaimedSol': float(response.get('reclaimedSol', 0)),
+            }
+        except Exception as e:
+            print(f"⚠ Error closing empty accounts: {e}")
+            return {'closed': 0, 'reclaimedSol': 0}
+
     def get_lp_value_sol(self, pool_id: str, lp_mint: str) -> Dict:
         """Get on-chain LP token value and current price ratio.
         

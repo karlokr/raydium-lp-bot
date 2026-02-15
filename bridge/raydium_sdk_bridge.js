@@ -1157,6 +1157,61 @@ async function listTokens() {
     }
 }
 
+/**
+ * Close all empty (zero-balance) token accounts to reclaim rent.
+ * Batches into transactions of up to 20 close instructions each.
+ * Optionally accepts a comma-separated list of mints to keep.
+ */
+async function closeEmptyAccounts(keepMints = '') {
+    try {
+        const keepSet = new Set(keepMints ? keepMints.split(',').map(m => m.trim()) : []);
+        // Always keep WSOL — it's handled separately by unwrap
+        keepSet.add(NATIVE_MINT.toString());
+
+        const tokenAccounts = await getOwnerTokenAccounts();
+        const toClose = [];
+        for (const acct of tokenAccounts) {
+            const mint = acct.accountInfo.mint.toString();
+            const balance = acct.accountInfo.amount;
+            if (balance.isZero() && !keepSet.has(mint)) {
+                toClose.push(acct.pubkey);
+            }
+        }
+
+        if (toClose.length === 0) {
+            console.log(JSON.stringify({ success: true, closed: 0, reclaimedSol: 0 }));
+            return;
+        }
+
+        console.error(`Closing ${toClose.length} empty token account(s)...`);
+
+        let totalClosed = 0;
+        const BATCH_SIZE = 20; // ~20 close instructions fit in one tx
+        for (let i = 0; i < toClose.length; i += BATCH_SIZE) {
+            const batch = toClose.slice(i, i + BATCH_SIZE);
+            const tx = new Transaction();
+            for (const pubkey of batch) {
+                tx.add(createCloseAccountInstruction(pubkey, wallet.publicKey, wallet.publicKey));
+            }
+
+            const { blockhash } = await connection.getLatestBlockhash();
+            tx.recentBlockhash = blockhash;
+            tx.feePayer = wallet.publicKey;
+            tx.sign(wallet);
+            await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+            totalClosed += batch.length;
+            console.error(`  Batch ${Math.floor(i / BATCH_SIZE) + 1}: closed ${batch.length} account(s)`);
+        }
+
+        // Rent per ATA is ~0.00203928 SOL
+        const reclaimedSol = parseFloat((totalClosed * 0.00203928).toFixed(6));
+        console.log(JSON.stringify({ success: true, closed: totalClosed, reclaimedSol }));
+    } catch (err) {
+        console.log(JSON.stringify({ success: false, error: err.message }));
+        process.exit(1);
+    }
+}
+
 // CLI interface
 const command = process.argv[2];
 
@@ -1184,6 +1239,9 @@ switch (command) {
         break;
     case 'listtokens':
         listTokens();
+        break;
+    case 'closeaccounts':
+        closeEmptyAccounts(process.argv[3] || '');
         break;
     case 'test':
         test();

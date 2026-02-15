@@ -48,8 +48,11 @@ class LiquidityBot:
         # before LP recovery so we don't accidentally exit them
         self._load_saved_state()
 
-        # Unwrap any WSOL to native SOL at startup
-        # (the SDK uses native SOL for all operations)
+        # Full cleanup at startup:
+        #   1. Unwrap WSOL → native SOL
+        #   2. Auto-close ghost positions (LP=0 on-chain)
+        #   3. Recover leftover LP tokens (orphans from previous runs)
+        #   4. Close empty token accounts → reclaim rent
         if self.executor and not config.DRY_RUN:
             wsol = self.executor.get_wsol_balance()
             if wsol > 0.001:
@@ -58,9 +61,19 @@ class LiquidityBot:
                 if unwrapped > 0:
                     print(f"✓ Unwrapped {unwrapped:.4f} WSOL → native SOL")
 
+            # Auto-close ghost positions (LP tokens gone on-chain)
+            self._cleanup_ghost_positions()
+
             # Recover any leftover LP tokens from previous runs
             # (skips LP mints belonging to restored positions)
             self._recover_leftover_lp_tokens()
+
+            # Close empty token accounts to reclaim rent
+            keep_mints = [pos.lp_mint for pos in self.position_manager.active_positions.values() if pos.lp_mint]
+            result = self.executor.close_empty_accounts(keep_mints=keep_mints)
+            if result['closed'] > 0:
+                time.sleep(2)
+                print(f"🧹 Closed {result['closed']} empty token account(s), reclaimed ~{result['reclaimedSol']:.4f} SOL in rent")
 
         # Capital is always the current wallet balance
         self.available_capital = 0.0  # in SOL
@@ -151,6 +164,47 @@ class LiquidityBot:
             snapshot_tracker=self.snapshot_tracker,
             last_scan_pools=self._last_scan_pools,
         )
+
+    def _cleanup_ghost_positions(self):
+        """At startup, check each restored position on-chain.
+        If LP tokens are 0 on-chain, auto-close the ghost position
+        (swap any remaining tokens back to SOL and remove from state)."""
+        if not self.executor:
+            return
+
+        ghosts = []
+        for amm_id, pos in list(self.position_manager.active_positions.items()):
+            if not pos.lp_mint:
+                ghosts.append((amm_id, pos))
+                continue
+            lp_raw = self.executor.get_token_balance(pos.lp_mint)
+            if lp_raw == 0:
+                ghosts.append((amm_id, pos))
+
+        if not ghosts:
+            return
+
+        print(f"\n🧹 Found {len(ghosts)} ghost position(s) (LP=0 on-chain) — cleaning up...")
+        for amm_id, pos in ghosts:
+            print(f"  🔄 Cleaning ghost: {pos.pool_name}")
+            # Try to swap any remaining non-SOL tokens back
+            try:
+                self.executor.swap_tokens(
+                    pool_id=amm_id,
+                    amount_in=0,  # sell-all
+                    direction='sell',
+                )
+                time.sleep(2)
+            except Exception:
+                pass
+
+            sol_price = self.api_client.get_sol_price_usd()
+            state.append_trade_history(pos, "Ghost cleanup (startup)", sol_price_usd=sol_price)
+            self.position_manager.close_position(amm_id, "Ghost cleanup (startup)")
+            print(f"  ✓ Removed ghost: {pos.pool_name}")
+
+        self._save_state()
+        print(f"🧹 Ghost cleanup complete — {len(ghosts)} position(s) removed\n")
 
     def _recover_leftover_lp_tokens(self):
         """Find any leftover LP tokens from previous runs and convert them back to SOL.
