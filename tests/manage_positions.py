@@ -249,7 +249,7 @@ def close_all_positions(positions: dict, executor: RaydiumExecutor,
                 failed_pools=set(saved.get('failed_pools', [])),
             )
         else:
-            state.clear_state()
+            pass  # State file kept for cooldowns/snapshots
 
     # Final balance
     final_balance = executor.get_balance()

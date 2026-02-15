@@ -335,6 +335,7 @@ class LiquidityBot:
 
         pools_data = {}
         on_chain_data = {}  # amm_id -> {valueSol, priceRatio}
+        ghost_positions = []  # positions whose LP tokens are gone on-chain
 
         for amm_id, pos in self.position_manager.active_positions.items():
             pool = self.api_client.get_pool_by_id(amm_id)
@@ -342,14 +343,36 @@ class LiquidityBot:
                 pools_data[amm_id] = pool
 
             # Get on-chain LP value + real-time price from reserves
-            if pos.lp_mint and pos.lp_token_amount > 0 and self.executor:
+            if pos.lp_mint and self.executor:
                 data = self.executor.get_lp_value_sol(amm_id, pos.lp_mint)
                 if data:
+                    lp_bal = data.get('lpBalance', -1)
+                    val = data.get('valueSol', 0)
+
+                    # Detect ghost position: LP tokens gone on-chain
+                    if val == 0 and lp_bal == 0 and pos.time_held_hours > 0.05:
+                        ghost_positions.append(amm_id)
+                        continue
+
+                    # If we had lp_token_amount=0 (missed at entry) but LP exists, fix it
+                    if lp_bal > 0 and pos.lp_token_amount == 0:
+                        lp_dec = pos.lp_decimals if pos.lp_decimals > 0 else 9
+                        pos.lp_token_amount = lp_bal / (10 ** lp_dec)
+                        print(f"  ✓ Recovered LP balance for {pos.pool_name}: {pos.lp_token_amount:.6f}")
+
                     on_chain_data[amm_id] = data
             elif not pos.lp_mint:
                 print(f"  ⚠ No lp_mint set for {pos.pool_name}")
-            elif pos.lp_token_amount <= 0:
-                print(f"  ⚠ lp_token_amount is 0 for {pos.pool_name}")
+
+        # Clean up ghost positions (LP tokens gone on-chain but state not updated)
+        for amm_id in ghost_positions:
+            pos = self.position_manager.active_positions.get(amm_id)
+            if pos:
+                print(f"  ⚠ Ghost position detected: {pos.pool_name} — LP tokens are 0 on-chain, cleaning up")
+                sol_price = self.api_client.get_sol_price_usd()
+                state.append_trade_history(pos, "Ghost cleanup (LP=0)", sol_price_usd=sol_price)
+                self.position_manager.close_position(amm_id, "Ghost cleanup")
+                self._save_state()
 
         # Update each position — prefer on-chain price, fall back to API
         for amm_id, position in list(self.position_manager.active_positions.items()):
@@ -398,10 +421,19 @@ class LiquidityBot:
                 )
 
                 if not signature:
-                    print(f"✗ Remove liquidity failed - position still open")
-                    return False
+                    # Check if LP tokens are actually already gone on-chain
+                    # (e.g. previous exit succeeded but state wasn't saved)
+                    onchain_balance = 0
+                    if position.lp_mint:
+                        onchain_balance = self.executor.get_token_balance(position.lp_mint)
+                    if onchain_balance == 0:
+                        print(f"  ℹ LP tokens already withdrawn on-chain — cleaning up stale position")
+                    else:
+                        print(f"✗ Remove liquidity failed - position still open")
+                        return False
 
-                position.pool_data['exit_signature'] = signature
+                else:
+                    position.pool_data['exit_signature'] = signature
             else:
                 print(f"⚠ No LP tokens found for {position.pool_name}")
 
@@ -432,7 +464,7 @@ class LiquidityBot:
             # Cooldown: don't re-enter pools we exited at a loss
             if reason in ("Stop Loss", "High IL"):
                 self._exit_cooldowns[amm_id] = time.time()
-                print(f"  🕐 Cooldown: {reason} exit — won't re-enter for {config.EXIT_COOLDOWN_SEC // 60} min")
+                print(f"  🕐 Cooldown: {reason} exit — won't re-enter for {config.EXIT_COOLDOWN_SEC // 3600}h")
             # Persist state after exit
             self._save_state()
         return success
@@ -568,17 +600,38 @@ class LiquidityBot:
 
                 position.pool_data['entry_signature'] = add_result['signature']
 
-                # Track LP token balance
+                # Track LP token balance — retry with backoff since on-chain
+                # state may not be immediately visible after tx confirmation
                 lp_mint = add_result.get('lpMint', '')
                 if lp_mint:
                     position.lp_mint = lp_mint
-                    import time as _time
-                    _time.sleep(1)
-                    lp_raw = self.executor.get_token_balance(lp_mint)
                     lp_decimals = pool.get('lpDecimals', 9)
                     position.lp_decimals = lp_decimals
-                    position.lp_token_amount = lp_raw / (10 ** lp_decimals)
-                    print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
+
+                    lp_raw = 0
+                    for attempt, delay in enumerate([2, 3, 5], 1):
+                        import time as _time
+                        _time.sleep(delay)
+                        lp_raw = self.executor.get_token_balance(lp_mint)
+                        if lp_raw > 0:
+                            break
+                        print(f"  ⏳ LP balance not yet visible (attempt {attempt}/3)...")
+
+                    if lp_raw > 0:
+                        position.lp_token_amount = lp_raw / (10 ** lp_decimals)
+                        print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
+                    else:
+                        # LP tokens never appeared — roll back
+                        print(f"  ✗ LP tokens not found on-chain after add — rolling back")
+                        self.executor.swap_tokens(
+                            pool_id=amm_id,
+                            amount_in=0,
+                            direction='sell',
+                        )
+                        self.position_manager.close_position(amm_id)
+                        self._failed_pools.add(amm_id)
+                        self._refresh_balance()
+                        continue
 
             # Track committed capital ourselves — don't trust RPC balance
             committed += position.position_size_sol
@@ -804,6 +857,8 @@ class LiquidityBot:
             if unwrapped > 0:
                 print(f"  ✓ Unwrapped {unwrapped:.4f} WSOL")
 
+        # Wait for on-chain state to settle before reading balance
+        time.sleep(3)
         self._refresh_balance()
         print(f"\n  ✓ Closed {closed} position(s)  |  Balance: {self._usd(self.available_capital, sol_price)}\n")
 
@@ -870,15 +925,15 @@ class LiquidityBot:
         print("\nShutting down bot...")
         self.running = False
 
-        # Save state — positions persist on-chain and will be resumed next run
+        # Always save state — preserves cooldowns, snapshots, scan history
+        self._save_state()
         n = len(self.position_manager.active_positions)
         if n > 0:
-            self._save_state()
             names = [p.pool_name for p in self.position_manager.active_positions.values()]
             print(f"\n💾 Saved {n} active position(s) to disk: {', '.join(names)}")
             print(f"   Positions remain open on-chain — will resume on next run")
         else:
-            state.clear_state()
+            print(f"\n💾 State saved (cooldowns, snapshots, scan history)")
 
         self.print_status()
         print("✓ Bot stopped")

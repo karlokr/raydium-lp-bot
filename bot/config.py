@@ -51,7 +51,7 @@ class BotConfig:
     TAKE_PROFIT_PERCENT: float = 20.0  # Exit if up 20% (capture bigger swings)
     MAX_HOLD_TIME_HOURS: int = 24  # Force exit after 24 hours
     MAX_IMPERMANENT_LOSS: float = -5.0  # Exit if IL exceeds 5%
-    EXIT_COOLDOWN_SEC: int = 1800  # Don't re-enter a pool for 30 min after exiting at a loss
+    EXIT_COOLDOWN_SEC: int = 86400  # Don't re-enter a pool for 24 h after exiting at a loss
 
     # Trading Settings
     TRADING_ENABLED: bool = True  # Set to True to enable real transactions

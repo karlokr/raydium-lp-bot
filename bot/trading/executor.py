@@ -133,8 +133,11 @@ class RaydiumExecutor:
         
         Returns dict with:
           - valueSol: total SOL value of our LP tokens
+          - lpBalance: raw LP token balance (int)
           - priceRatio: current on-chain price (quoteReserve/baseReserve, human units)
-        Returns empty dict on failure.
+        Returns empty dict on failure (timeout, network error, etc).
+        Always returns data even when valueSol=0 — caller uses lpBalance to
+        distinguish "no LP tokens" from "fetch failed".
         """
         try:
             result = subprocess.run(
@@ -149,9 +152,12 @@ class RaydiumExecutor:
             response = json.loads(result.stdout.strip().split('\n')[-1])
             value_sol = float(response.get('valueSol', 0))
             price_ratio = float(response.get('priceRatio', 0))
-            if value_sol > 0:
-                return {'valueSol': value_sol, 'priceRatio': price_ratio}
-            return {}
+            lp_balance = int(response.get('lpBalance', 0))
+            return {
+                'valueSol': value_sol,
+                'priceRatio': price_ratio,
+                'lpBalance': lp_balance,
+            }
         except Exception as e:
             print(f"  ⚠ lpvalue exception: {e}")
             return {}

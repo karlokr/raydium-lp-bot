@@ -126,9 +126,9 @@ class Position:
                 il_loss_sol = (self.current_il_percent / 100) * self.position_size_sol
                 self.fees_earned_sol = self.unrealized_pnl_sol - il_loss_sol
         else:
-            # No on-chain data available — PnL unknown, don't guess
-            self.unrealized_pnl_sol = 0.0
-            self.fees_earned_sol = 0.0
+            # No on-chain data available — keep last known PnL values
+            # (they'll be refreshed next cycle when the bridge responds)
+            pass
 
 
 class PositionManager:
@@ -293,7 +293,12 @@ class PositionManager:
         return to_close
 
     def get_total_deployed_capital(self) -> float:
-        return sum(pos.position_size_sol for pos in self.active_positions.values())
+        """Total current value of deployed capital.
+        Uses on-chain LP value when available, falls back to entry cost."""
+        return sum(
+            pos.current_lp_value_sol if pos.current_lp_value_sol > 0 else pos.position_size_sol
+            for pos in self.active_positions.values()
+        )
 
     def get_summary(self) -> Dict:
         total_deployed = self.get_total_deployed_capital()
