@@ -38,7 +38,8 @@ class TestBotConfigDefaults:
     def test_lp_lock_safety_defaults(self):
         cfg = BotConfig()
         assert cfg.CHECK_LP_LOCK is True
-        assert cfg.MIN_SAFE_LP_PERCENT == 50.0
+        assert cfg.MIN_LP_LOCK_PERCENT == 80.0
+        assert cfg.MIN_SAFE_LP_PERCENT == 90.0
         assert cfg.MAX_SINGLE_LP_HOLDER_PERCENT == 25.0
 
     def test_position_sizing_defaults(self):
