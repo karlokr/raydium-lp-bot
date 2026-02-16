@@ -35,53 +35,36 @@ def _ensure_dir():
 
 # ── Position serialization ──────────────────────────────────────────
 
+# Fields to serialize (order matches Position dataclass)
+_POS_FIELDS = [
+    'amm_id', 'pool_name', 'entry_price_ratio', 'position_size_sol',
+    'token_a_amount', 'token_b_amount', 'sol_is_base', 'lp_mint',
+    'lp_token_amount', 'lp_decimals', 'current_price_ratio',
+    'current_il_percent', 'fees_earned_sol', 'unrealized_pnl_sol',
+    'current_lp_value_sol',
+]
+
+
 def position_to_dict(pos) -> dict:
     """Serialize a Position dataclass to a JSON-safe dict."""
-    return {
-        'amm_id': pos.amm_id,
-        'pool_name': pos.pool_name,
-        'entry_time': pos.entry_time.isoformat(),
-        'entry_price_ratio': pos.entry_price_ratio,
-        'position_size_sol': pos.position_size_sol,
-        'token_a_amount': pos.token_a_amount,
-        'token_b_amount': pos.token_b_amount,
-        'sol_is_base': pos.sol_is_base,
-        'lp_mint': pos.lp_mint,
-        'lp_token_amount': pos.lp_token_amount,
-        'lp_decimals': pos.lp_decimals,
-        'current_price_ratio': pos.current_price_ratio,
-        'current_il_percent': pos.current_il_percent,
-        'fees_earned_sol': pos.fees_earned_sol,
-        'unrealized_pnl_sol': pos.unrealized_pnl_sol,
-        'current_lp_value_sol': pos.current_lp_value_sol,
-        'pool_data': _sanitize_pool_data(pos.pool_data),
-    }
+    d = {f: getattr(pos, f) for f in _POS_FIELDS}
+    d['entry_time'] = pos.entry_time.isoformat()
+    d['pool_data'] = _sanitize_pool_data(pos.pool_data)
+    return d
 
 
 def position_from_dict(d: dict):
     """Deserialize a dict back to a Position dataclass."""
     from bot.trading.position_manager import Position
-
-    pos = Position(
-        amm_id=d['amm_id'],
-        pool_name=d['pool_name'],
+    # Required fields passed directly; optional fields use dataclass defaults
+    defaults = {f: Position.__dataclass_fields__[f].default for f in _POS_FIELDS
+                if f in Position.__dataclass_fields__ and f not in d}
+    kw = {f: d.get(f, defaults.get(f)) for f in _POS_FIELDS}
+    return Position(
         entry_time=datetime.fromisoformat(d['entry_time']),
-        entry_price_ratio=d['entry_price_ratio'],
-        position_size_sol=d['position_size_sol'],
-        token_a_amount=d['token_a_amount'],
-        token_b_amount=d['token_b_amount'],
-        sol_is_base=d.get('sol_is_base', False),
-        lp_mint=d.get('lp_mint', ''),
-        lp_token_amount=d.get('lp_token_amount', 0.0),
-        lp_decimals=d.get('lp_decimals', 0),
-        current_price_ratio=d.get('current_price_ratio', 0.0),
-        current_il_percent=d.get('current_il_percent', 0.0),
-        fees_earned_sol=d.get('fees_earned_sol', 0.0),
-        unrealized_pnl_sol=d.get('unrealized_pnl_sol', 0.0),
-        current_lp_value_sol=d.get('current_lp_value_sol', 0.0),
         pool_data=d.get('pool_data', {}),
+        **kw,
     )
-    return pos
 
 
 def _sanitize_pool_data(pool_data: dict) -> dict:
@@ -89,17 +72,14 @@ def _sanitize_pool_data(pool_data: dict) -> dict:
     if not pool_data:
         return {}
     clean = {}
+    _simple = (str, int, float, bool, type(None))
     for k, v in pool_data.items():
-        if isinstance(v, (str, int, float, bool, type(None))):
+        if isinstance(v, _simple):
             clean[k] = v
         elif isinstance(v, dict):
             clean[k] = _sanitize_pool_data(v)
         elif isinstance(v, (list, tuple)):
-            clean[k] = [
-                x for x in v
-                if isinstance(x, (str, int, float, bool, type(None)))
-            ]
-        # Skip non-serializable types
+            clean[k] = [x for x in v if isinstance(x, _simple)]
     return clean
 
 
