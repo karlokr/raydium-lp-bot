@@ -54,13 +54,15 @@ class TestGetTokenReport:
         assert api.get_token_report("bad") is None
 
     @patch("bot.safety.rugcheck.requests.get")
-    def test_server_error(self, mock_get, api):
+    def test_server_error_retries(self, mock_get, api):
         mock_get.return_value = MagicMock(status_code=500)
         assert api.get_token_report("err") is None
+        assert mock_get.call_count == 3  # 1 original + 2 retries
 
     @patch("bot.safety.rugcheck.requests.get", side_effect=requests.RequestException("timeout"))
-    def test_exception(self, _, api):
+    def test_exception_retries(self, mock_get, api):
         assert api.get_token_report("fail") is None
+        assert mock_get.call_count == 3  # 1 original + 2 retries
 
 
 class TestAnalyzeTokenSafety:

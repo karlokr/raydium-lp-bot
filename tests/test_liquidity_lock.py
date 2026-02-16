@@ -47,14 +47,15 @@ class TestRpcCall:
     def test_rpc_error(self, mock_post, analyzer):
         mock_post.return_value = MagicMock(
             status_code=200,
-            json=lambda: {"jsonrpc": "2.0", "error": {"message": "bad"}},
+            json=lambda: {"jsonrpc": "2.0", "error": {"message": "bad", "code": -32600}},
         )
         mock_post.return_value.raise_for_status = MagicMock()
         assert analyzer._rpc_call("getBalance", []) is None
 
     @patch("bot.safety.liquidity_lock.requests.post", side_effect=Exception("net"))
-    def test_exception(self, _, analyzer):
+    def test_exception_retries(self, mock_post, analyzer):
         assert analyzer._rpc_call("test", []) is None
+        assert mock_post.call_count == 3  # 1 original + 2 retries
 
 
 class TestAnalyzeLpLock:

@@ -150,13 +150,14 @@ class TestAnalyzePoolRugCheck:
         result = analyzer.analyze_pool(sample_pool)
         assert result["is_safe"] is False
 
-    def test_rugcheck_unavailable_adds_warning(self, analyzer, sample_pool):
+    def test_rugcheck_unavailable_rejects_pool(self, analyzer, sample_pool):
         rc = _safe_rugcheck()
         rc["available"] = False
         analyzer.rugcheck.analyze_token_safety.return_value = rc
         analyzer.lp_lock.analyze_lp_lock.return_value = _safe_lp_lock()
         result = analyzer.analyze_pool(sample_pool)
-        assert any("unavailable" in w.lower() for w in result["warnings"])
+        assert result["is_safe"] is False
+        assert any("unavailable" in r.lower() for r in result["risks"])
 
 
 class TestShortCircuit:
@@ -194,12 +195,13 @@ class TestLpLockAnalysis:
         result = analyzer.analyze_pool(sample_pool)
         assert result["is_safe"] is False
 
-    def test_lp_lock_unavailable_only_warning(self, analyzer, sample_pool):
+    def test_lp_lock_unavailable_rejects_pool(self, analyzer, sample_pool):
         analyzer.rugcheck.analyze_token_safety.return_value = _safe_rugcheck()
         analyzer.lp_lock.analyze_lp_lock.return_value = {"available": False}
         result = analyzer.analyze_pool(sample_pool)
-        # Should still be safe — LP lock being unavailable is just a warning
-        assert any("unavailable" in w.lower() for w in result["warnings"])
+        # LP lock unavailable = cannot verify safety = reject
+        assert result["is_safe"] is False
+        assert any("unavailable" in r.lower() for r in result["risks"])
 
 
 class TestGetSafePools:
