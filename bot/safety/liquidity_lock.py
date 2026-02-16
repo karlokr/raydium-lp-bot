@@ -53,9 +53,17 @@ class LiquidityLockAnalyzer:
         self.rpc_url = rpc_url or config.RPC_ENDPOINT
         self._cache: Dict[str, tuple] = {}  # lp_mint -> (result, timestamp)
         self._cache_ttl = 300  # 5 minutes
+        self._last_rpc_time: float = 0  # timestamp of last RPC call
+        self._rpc_min_interval: float = 0.2  # 200ms between RPC calls to avoid bursts
 
     def _rpc_call(self, method: str, params: list) -> Optional[Dict]:
-        """Make a single Solana JSON-RPC call."""
+        """Make a single Solana JSON-RPC call with rate throttling."""
+        # Throttle: wait at least _rpc_min_interval between RPC calls
+        now = time.time()
+        elapsed = now - self._last_rpc_time
+        if elapsed < self._rpc_min_interval:
+            time.sleep(self._rpc_min_interval - elapsed)
+
         try:
             resp = requests.post(
                 self.rpc_url,
@@ -67,6 +75,7 @@ class LiquidityLockAnalyzer:
                 },
                 timeout=15,
             )
+            self._last_rpc_time = time.time()
             resp.raise_for_status()
             data = resp.json()
             if "error" in data:

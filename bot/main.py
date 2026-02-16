@@ -37,6 +37,7 @@ class LiquidityBot:
         self.analyzer.set_snapshot_tracker(self.snapshot_tracker)
         self.position_manager = PositionManager()
         self.price_tracker = PriceTracker(self.api_client)
+        self.quality_analyzer = PoolQualityAnalyzer()  # Persistent: RugCheck + LP lock caches survive across scans
 
         # Executor for real transactions
         try:
@@ -478,7 +479,8 @@ class LiquidityBot:
 
         safe_pools = PoolQualityAnalyzer.get_safe_pools(
             pools,
-            check_locks=config.CHECK_TOKEN_SAFETY
+            check_locks=config.CHECK_TOKEN_SAFETY,
+            analyzer=self.quality_analyzer,
         )
 
         top_pools = self.analyzer.rank_pools(safe_pools, top_n=10)
@@ -522,11 +524,24 @@ class LiquidityBot:
         on_chain_data = {}  # amm_id -> {valueSol, priceRatio}
         ghost_positions = []  # positions whose LP tokens are gone on-chain
 
-        for amm_id, pos in self.position_manager.active_positions.items():
-            # Get on-chain LP value + real-time price from reserves
-            if pos.lp_mint and self.executor:
-                data = self.executor.get_lp_value_sol(amm_id, pos.lp_mint)
-                if data:
+        # Batch-fetch LP values for ALL positions in a single subprocess
+        # (2 RPC calls total instead of 6 per position)
+        if self.executor:
+            batch_entries = []
+            for amm_id, pos in self.position_manager.active_positions.items():
+                if pos.lp_mint:
+                    batch_entries.append({'pool_id': amm_id, 'lp_mint': pos.lp_mint})
+                else:
+                    print(f"  ⚠ No lp_mint set for {pos.pool_name}")
+
+            if batch_entries:
+                batch_results = self.executor.batch_get_lp_values(batch_entries)
+
+                for amm_id, pos in self.position_manager.active_positions.items():
+                    data = batch_results.get(amm_id, {})
+                    if not data:
+                        continue
+
                     lp_bal = data.get('lpBalance', -1)
                     val = data.get('valueSol', 0)
 
@@ -542,8 +557,6 @@ class LiquidityBot:
                         print(f"  ✓ Recovered LP balance for {pos.pool_name}: {pos.lp_token_amount:.6f}")
 
                     on_chain_data[amm_id] = data
-            elif not pos.lp_mint:
-                print(f"  ⚠ No lp_mint set for {pos.pool_name}")
 
         # Clean up ghost positions (LP tokens gone on-chain but state not updated)
         for amm_id in ghost_positions:

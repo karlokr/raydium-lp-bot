@@ -166,17 +166,30 @@ class PoolQualityAnalyzer:
                 else:
                     warnings.append("RugCheck data unavailable for this token")
 
+        # --- Short-circuit: skip expensive LP lock RPC calls if already rejected ---
+        if risks:
+            return {
+                'risk_level': 'HIGH',
+                'risks': risks,
+                'warnings': warnings,
+                'is_safe': False,
+                'burn_percent': burn_percent,
+                'liquidity_tier': 'high' if tvl > 100_000 else 'medium' if tvl > 50_000 else 'low',
+                'rugcheck': rugcheck_result,
+                'lp_lock': None,
+            }
+
         # --- On-chain LP Lock Analysis ---
         # burnPercent (from API) = what % of initial LP was destroyed at creation.
         # On-chain LP lock = of the REMAINING circulating LP, who controls it?
         #
         # Combined risk: what % of the pool's TOTAL initial liquidity can
-        # a single wallet pull?  = max_single_unlocked_pct × (1 - burnPercent/100)
+        # a single wallet pull?  = max_single_unlocked_pct x (1 - burnPercent/100)
         #
         # Example: burnPercent=99%, top holder has 50% of remaining LP
-        #   → they can pull 50% × 1% = 0.5% of total liquidity → negligible
+        #   -> they can pull 50% x 1% = 0.5% of total liquidity (negligible)
         # Example: burnPercent=50%, top holder has 60% of remaining LP
-        #   → they can pull 60% × 50% = 30% of total liquidity → dangerous
+        #   -> they can pull 60% x 50% = 30% of total liquidity (dangerous)
         lp_lock_result = None
         if check_safety and config.CHECK_LP_LOCK:
             lp_mint_info = pool.get('lpMint', {})
@@ -238,15 +251,18 @@ class PoolQualityAnalyzer:
         }
 
     @staticmethod
-    def get_safe_pools(pools: List[Dict], check_locks: bool = False) -> List[Dict]:
+    def get_safe_pools(pools: List[Dict], check_locks: bool = False,
+                       analyzer: 'PoolQualityAnalyzer' = None) -> List[Dict]:
         """
         Filter pools to only safe ones.
 
         Args:
             pools: List of V3 pool dicts
             check_locks: If True, also check RugCheck token safety
+            analyzer: Optional persistent instance (reuses caches across scans)
         """
-        analyzer = PoolQualityAnalyzer()
+        if analyzer is None:
+            analyzer = PoolQualityAnalyzer()
         safe_pools = []
 
         for pool in pools:

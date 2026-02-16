@@ -1213,6 +1213,174 @@ async function getLpValue(poolId, lpMint) {
 }
 
 /**
+ * Batch LP value lookup for multiple positions.
+ *
+ * Uses getMultipleAccountsInfo to fetch all accounts in just 2 RPC calls
+ * (1 for AMM states, 1 for LP ATAs + vault accounts) instead of 6 per position.
+ *
+ * Input: JSON string of [{poolId, lpMint}, ...]
+ * Output: JSON {results: {poolId: {valueSol, lpBalance, priceRatio}, ...}}
+ */
+async function batchLpValue(jsonInput) {
+    try {
+        const entries = JSON.parse(jsonInput);
+        if (!entries || !entries.length) {
+            console.log(JSON.stringify({ results: {} }));
+            return;
+        }
+
+        // Step 1: Batch-read all AMM accounts in a single RPC call
+        const ammPubkeys = entries.map(e => new PublicKey(e.poolId));
+        const ammAccounts = await rpcRetry(
+            () => connection.getMultipleAccountsInfo(ammPubkeys),
+            'getMultipleAccountsInfo(AMM×' + entries.length + ')'
+        );
+
+        // Parse AMM states and collect addresses for step 2
+        const poolStates = [];     // one per entry (null if failed)
+        const step2Keys = [];      // flat list of pubkeys for batch read
+        // For each valid pool: LP ATA, baseVault, quoteVault, openOrders (4 accounts)
+
+        for (let i = 0; i < entries.length; i++) {
+            const ammInfo = ammAccounts[i];
+            if (!ammInfo || !ammInfo.owner.equals(RAYDIUM_V4_PROGRAM)) {
+                poolStates.push(null);
+                continue;
+            }
+
+            const amm = LIQUIDITY_STATE_LAYOUT_V4.decode(ammInfo.data);
+            const baseIsWsol = amm.baseMint.equals(WSOL_MINT);
+            const quoteIsWsol = amm.quoteMint.equals(WSOL_MINT);
+            if (!baseIsWsol && !quoteIsWsol) {
+                poolStates.push(null);
+                continue;
+            }
+
+            const lpMintPubkey = new PublicKey(entries[i].lpMint);
+            const lpAta = await getAssociatedTokenAddress(lpMintPubkey, wallet.publicKey);
+
+            const startIdx = step2Keys.length;
+            step2Keys.push(lpAta);           // +0
+            step2Keys.push(amm.baseVault);   // +1
+            step2Keys.push(amm.quoteVault);  // +2
+            step2Keys.push(amm.openOrders);  // +3
+
+            poolStates.push({
+                startIdx,
+                baseIsWsol,
+                baseDecimals: amm.baseDecimal.toNumber(),
+                quoteDecimals: amm.quoteDecimal.toNumber(),
+                lpReserve: amm.lpReserve,
+                baseNeedTakePnl: amm.baseNeedTakePnl,
+                quoteNeedTakePnl: amm.quoteNeedTakePnl,
+            });
+        }
+
+        // Step 2: Batch-read all LP ATAs + vault accounts in a single RPC call
+        let step2Accounts = [];
+        if (step2Keys.length > 0) {
+            step2Accounts = await rpcRetry(
+                () => connection.getMultipleAccountsInfo(step2Keys),
+                'getMultipleAccountsInfo(vaults×' + step2Keys.length + ')'
+            );
+        }
+
+        // Step 3: Compute values for each position
+        const results = {};
+
+        for (let i = 0; i < entries.length; i++) {
+            const poolId = entries[i].poolId;
+            const ps = poolStates[i];
+
+            if (!ps) {
+                results[poolId] = { valueSol: 0, lpBalance: 0, priceRatio: 0 };
+                continue;
+            }
+
+            const lpAcctInfo    = step2Accounts[ps.startIdx];
+            const baseVaultInfo = step2Accounts[ps.startIdx + 1];
+            const quoteVaultInfo = step2Accounts[ps.startIdx + 2];
+            const openOrdersInfo = step2Accounts[ps.startIdx + 3];
+
+            if (!lpAcctInfo) {
+                results[poolId] = { valueSol: 0, lpBalance: 0, priceRatio: 0 };
+                continue;
+            }
+
+            const lpBalance = new BN(lpAcctInfo.data.readBigUInt64LE(64).toString());
+            if (lpBalance.isZero()) {
+                results[poolId] = { valueSol: 0, lpBalance: 0, priceRatio: 0 };
+                continue;
+            }
+
+            if (!baseVaultInfo || !quoteVaultInfo) {
+                results[poolId] = { valueSol: 0, lpBalance: parseInt(lpBalance.toString()), priceRatio: 0 };
+                continue;
+            }
+
+            const baseVault = new BN(baseVaultInfo.data.readBigUInt64LE(64).toString());
+            const quoteVault = new BN(quoteVaultInfo.data.readBigUInt64LE(64).toString());
+
+            let ooBase = new BN(0);
+            let ooQuote = new BN(0);
+            if (openOrdersInfo && openOrdersInfo.data.length >= 109) {
+                ooBase = new BN(openOrdersInfo.data.readBigUInt64LE(85).toString());
+                ooQuote = new BN(openOrdersInfo.data.readBigUInt64LE(101).toString());
+            }
+
+            const baseReserveRaw = baseVault.add(ooBase);
+            const quoteReserveRaw = quoteVault.add(ooQuote);
+            const baseReserve = baseReserveRaw.gt(ps.baseNeedTakePnl)
+                ? baseReserveRaw.sub(ps.baseNeedTakePnl) : baseReserveRaw;
+            const quoteReserve = quoteReserveRaw.gt(ps.quoteNeedTakePnl)
+                ? quoteReserveRaw.sub(ps.quoteNeedTakePnl) : quoteReserveRaw;
+
+            const lpSupply = ps.lpReserve;
+            if (lpSupply.isZero()) {
+                results[poolId] = { valueSol: 0, lpBalance: parseInt(lpBalance.toString()), priceRatio: 0 };
+                continue;
+            }
+
+            const shareBase = lpBalance.mul(baseReserve).div(lpSupply);
+            const shareQuote = lpBalance.mul(quoteReserve).div(lpSupply);
+
+            let valueLamports;
+            if (ps.baseIsWsol) {
+                const quoteInSol = shareQuote.mul(baseReserve).div(quoteReserve);
+                valueLamports = shareBase.add(quoteInSol);
+            } else {
+                const baseInSol = shareBase.mul(quoteReserve).div(baseReserve);
+                valueLamports = shareQuote.add(baseInSol);
+            }
+
+            const valueSol = parseFloat(new Decimal(valueLamports.toString()).div(1e9).toString());
+
+            const priceRatio = baseReserve.isZero() ? 0 : parseFloat(
+                new Decimal(quoteReserve.toString())
+                    .div(new Decimal(10).pow(ps.quoteDecimals))
+                    .div(new Decimal(baseReserve.toString()).div(new Decimal(10).pow(ps.baseDecimals)))
+                    .toString()
+            );
+
+            results[poolId] = {
+                valueSol,
+                lpBalance: parseInt(lpBalance.toString()),
+                priceRatio,
+            };
+        }
+
+        console.log(JSON.stringify({ results }));
+
+    } catch (err) {
+        console.log(JSON.stringify({
+            success: false,
+            error: err.message,
+        }));
+        process.exit(1);
+    }
+}
+
+/**
  * List all non-zero token accounts in the wallet (excluding native SOL).
  * Returns an array of {mint, balance} for each token with balance > 0.
  */
@@ -1318,6 +1486,9 @@ switch (command) {
         break;
     case 'lpvalue':
         getLpValue(process.argv[3], process.argv[4]);
+        break;
+    case 'batchlpvalue':
+        batchLpValue(process.argv[3]);
         break;
     case 'poolkeys':
         testPoolKeys(process.argv[3]);

@@ -191,6 +191,48 @@ class RaydiumExecutor:
             print(f"  ⚠ lpvalue exception: {e}")
             return {}
 
+    def batch_get_lp_values(self, positions: list) -> Dict[str, Dict]:
+        """Batch LP value lookup for multiple positions in a single subprocess.
+
+        Uses the bridge's batchlpvalue command which reads all accounts via
+        getMultipleAccountsInfo — 2 RPC calls total instead of 6 per position.
+
+        Args:
+            positions: list of dicts with 'pool_id' and 'lp_mint' keys.
+
+        Returns:
+            {pool_id: {'valueSol': float, 'lpBalance': int, 'priceRatio': float}, ...}
+            Missing/failed pools return {'valueSol': 0, 'lpBalance': 0, 'priceRatio': 0}.
+        """
+        if not positions:
+            return {}
+
+        entries = [{'poolId': p['pool_id'], 'lpMint': p['lp_mint']} for p in positions]
+        try:
+            result = subprocess.run(
+                ['node', config.BRIDGE_SCRIPT, 'batchlpvalue', json.dumps(entries)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=os.environ.copy(),
+            )
+            if result.returncode != 0:
+                return {}
+            response = json.loads(result.stdout.strip().split('\n')[-1])
+            raw_results = response.get('results', {})
+
+            parsed = {}
+            for pool_id, data in raw_results.items():
+                parsed[pool_id] = {
+                    'valueSol': float(data.get('valueSol', 0)),
+                    'priceRatio': float(data.get('priceRatio', 0)),
+                    'lpBalance': int(data.get('lpBalance', 0)),
+                }
+            return parsed
+        except Exception as e:
+            print(f"  ⚠ batchlpvalue exception: {e}")
+            return {}
+
     def swap_tokens(
         self,
         pool_id: str,
