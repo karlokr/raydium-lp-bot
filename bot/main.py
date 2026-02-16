@@ -736,6 +736,26 @@ class LiquidityBot:
                 il_str = f"{pos.current_il_percent:.4f}%" if abs(pos.current_il_percent) < 1.0 else f"{pos.current_il_percent:.2f}%"
                 print(f"    Entry: {entry_str}  →  Value: {value_str}  |  P&L: {pos.unrealized_pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)  |  IL: {il_str}{exit_str}")
 
+                # Token price line
+                if pos.current_price_ratio > 0:
+                    token_name = pos.pool_name.replace("WSOL/", "").replace("/WSOL", "")
+                    price_sol = pos.current_price_ratio
+                    price_usd = price_sol * sol_price if sol_price > 0 else 0
+                    # Auto-format: use scientific notation for tiny prices
+                    if price_sol < 0.0001:
+                        sol_fmt = f"{price_sol:.2e}"
+                    elif price_sol < 1:
+                        sol_fmt = f"{price_sol:.6f}"
+                    else:
+                        sol_fmt = f"{price_sol:.4f}"
+                    if price_usd < 0.01:
+                        usd_fmt = f"${price_usd:.2e}"
+                    elif price_usd < 1:
+                        usd_fmt = f"${price_usd:.6f}"
+                    else:
+                        usd_fmt = f"${price_usd:.4f}"
+                    print(f"    {token_name} price: {sol_fmt} SOL ({usd_fmt})")
+
         print(f"{'─' * 60}\n")
 
     def _startup_position_check(self):
