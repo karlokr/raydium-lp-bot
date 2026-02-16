@@ -40,6 +40,7 @@ class LiquidityBot:
         self._shutting_down = False
         self.last_pool_scan = 0
         self.last_position_check = 0
+        self.last_status_print = 0
         self._failed_pools = set()  # Track pools that failed to avoid retrying
         self._exit_cooldowns: dict = {}  # amm_id -> timestamp of loss exit (cooldown)
         self._last_scan_pools: list = []  # Top-ranked pools from last scan
@@ -1070,8 +1071,9 @@ class LiquidityBot:
                     self.check_and_execute_exits()
                     self.last_position_check = current_time
 
-                if iteration % 10 == 0:
+                if current_time - self.last_status_print >= config.POSITION_CHECK_INTERVAL_SEC:
                     self.print_status()
+                    self.last_status_print = current_time
 
                 time.sleep(1)
 

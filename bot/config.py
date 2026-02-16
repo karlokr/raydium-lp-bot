@@ -60,7 +60,7 @@ class BotConfig:
 
     # Monitoring
     POOL_SCAN_INTERVAL_SEC: int = 180  # Scan for new pools every 3 minutes
-    POSITION_CHECK_INTERVAL_SEC: int = 10  # Check positions every 10 seconds
+    POSITION_CHECK_INTERVAL_SEC: int = 4  # Check positions every 4 seconds
 
     # Safety
     ENABLE_EMERGENCY_EXIT: bool = True  # Allow manual override
