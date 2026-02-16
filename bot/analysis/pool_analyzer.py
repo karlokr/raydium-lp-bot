@@ -39,10 +39,11 @@ class PoolAnalyzer:
         """Attach a SnapshotTracker so scoring can include velocity bonus."""
         self._snapshot_tracker = tracker
 
-    def calculate_pool_score(self, pool: Dict) -> float:
+    def calculate_pool_score(self, pool: Dict, _out: Dict = None) -> float:
         """
         Calculate a composite score for a pool (0-100 base + up to 10 bonus).
         Higher score = better LP opportunity.
+        If _out dict provided, component scores are stashed into it.
         """
         score = 0.0
 
@@ -110,6 +111,12 @@ class PoolAnalyzer:
         if self._snapshot_tracker and pool_id:
             velocity_bonus = self._snapshot_tracker.get_velocity_bonus(pool_id)
         score += velocity_bonus
+
+        if _out is not None:
+            _out['momentum'] = momentum_score
+            _out['freshness'] = freshness_score
+            _out['il_safety'] = il_score
+            _out['velocity'] = velocity_bonus
 
         return round(score, 2)
 
@@ -257,35 +264,18 @@ class PoolAnalyzer:
         return 5.0
 
     def rank_pools(self, pools: List[Dict], top_n: int = 10) -> List[Dict]:
-        """Score and rank pools, return top N.
-        
-        Injects component scores into each pool dict for downstream logging.
-        """
-        scored_pools = []
-
+        """Score and rank pools, return top N with component scores."""
+        scored = []
         for pool in pools:
-            pool_copy = pool.copy()
-            pool_copy['score'] = self.calculate_pool_score(pool)
-
-            # Attach component scores for transparency
-            day = pool.get('day', {})
-            week = pool.get('week', {})
-            volume = day.get('volume', 0) or pool.get('volume24h', 0)
-            tvl = pool.get('tvl', 0) or pool.get('liquidity', 0)
-            pool_copy['_momentum'] = self._calculate_momentum(day, week, volume, tvl)
-            pool_copy['_freshness'] = self._calculate_freshness(pool, pool_copy['score'])
-            pool_copy['_il_safety'] = self._estimate_il_safety(pool)
-
-            pool_id = pool.get('ammId', pool.get('id', ''))
-            if self._snapshot_tracker and pool_id:
-                pool_copy['_velocity'] = self._snapshot_tracker.get_velocity_bonus(pool_id)
-            else:
-                pool_copy['_velocity'] = 0.0
-
-            scored_pools.append(pool_copy)
-
-        ranked = sorted(scored_pools, key=lambda x: x['score'], reverse=True)
-        return ranked[:top_n]
+            copy = pool.copy()
+            components = {}
+            copy['score'] = self.calculate_pool_score(pool, _out=components)
+            copy['_momentum'] = components.get('momentum', 0)
+            copy['_freshness'] = components.get('freshness', 0)
+            copy['_il_safety'] = components.get('il_safety', 0)
+            copy['_velocity'] = components.get('velocity', 0)
+            scored.append(copy)
+        return sorted(scored, key=lambda x: x['score'], reverse=True)[:top_n]
 
     def calculate_position_size(
         self,
