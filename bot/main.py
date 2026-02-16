@@ -850,8 +850,9 @@ class LiquidityBot:
         # Ask user what to do
         can_close = (self.executor and not config.DRY_RUN and config.TRADING_ENABLED)
         if can_close:
-            print(f"\n  [Enter]  Continue with these positions")
-            print(f"  [close]  Close ALL positions and start fresh")
+            print(f"\n  [Enter]    Continue with these positions")
+            print(f"  [1 2 ...]  Close specific position(s) by number")
+            print(f"  [all]      Close ALL positions")
         else:
             print(f"\n  Press Enter to continue...")
 
@@ -861,25 +862,108 @@ class LiquidityBot:
             print("\n")
             sys.exit(0)
 
-        if answer != 'close' or not can_close:
+        if not answer or not can_close:
             print(f"  ✓ Continuing with {len(positions)} existing position(s)\n")
             return
 
-        # Double confirm
+        # Route to appropriate handler
+        if answer in ('all', 'close'):
+            # Double confirm for close all
+            try:
+                confirm = input(f"  ⚠ Close ALL {len(positions)} position(s)? Type 'confirm': ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled — continuing with existing positions\n")
+                return
+
+            if confirm != 'confirm':
+                print(f"  ✓ Continuing with {len(positions)} existing position(s)\n")
+                return
+
+            # Close all positions
+            print()
+            closed = 0
+            for amm_id, pos in list(positions.items()):
+                print(f"  🔄 Closing {pos.pool_name}...")
+                success = self._exit_position(amm_id, "Manual close (startup)")
+                if success:
+                    closed += 1
+                else:
+                    print(f"  ✗ Failed to close {pos.pool_name}")
+
+            # Unwrap any remaining WSOL
+            if self.executor:
+                unwrapped = self.executor.unwrap_wsol()
+                if unwrapped > 0:
+                    print(f"  ✓ Unwrapped {unwrapped:.4f} WSOL")
+
+            # Wait for on-chain state to settle before reading balance
+            time.sleep(3)
+            self._refresh_balance(force=True)
+            print(f"\n  ✓ Closed {closed} position(s)  |  Balance: {self._usd(self.available_capital, sol_price)}\n")
+        else:
+            # Parse as specific position numbers
+            self._close_specific_positions(positions, sol_price)
+
+    def _close_specific_positions(self, positions: dict, sol_price: float):
+        """Interactively close specific positions by number."""
+        print("\n  Options:")
+        print("    • Type position numbers to close (e.g., '1,3' or '1 3')")
+        print("    • Type 'all' to close all positions")
+        print("    • Press Enter to skip\n")
+
         try:
-            confirm = input(f"  ⚠ Close {len(positions)} position(s) on-chain? Type 'confirm': ").strip().lower()
+            response = input("  → ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("\n  Cancelled — continuing with existing positions\n")
+            print("\n  Cancelled\n")
             return
 
-        if confirm != 'confirm':
+        if not response:
             print(f"  ✓ Continuing with {len(positions)} existing position(s)\n")
             return
 
-        # Close all positions
+        # Parse selection
+        to_close = []
+        pos_list = list(positions.items())
+
+        if response == 'all':
+            to_close = pos_list
+        else:
+            # Parse comma or space-separated numbers
+            parts = response.replace(',', ' ').split()
+            for part in parts:
+                try:
+                    idx = int(part) - 1  # user sees 1-indexed
+                    if 0 <= idx < len(pos_list):
+                        to_close.append(pos_list[idx])
+                    else:
+                        print(f"  ⚠ Invalid position number: {part}")
+                except ValueError:
+                    print(f"  ⚠ Invalid input: {part}")
+
+        if not to_close:
+            print(f"  ✓ Continuing with {len(positions)} existing position(s)\n")
+            return
+
+        # Confirm
+        print(f"\n  → Closing {len(to_close)} position(s):")
+        for amm_id, pos in to_close:
+            print(f"     • {pos.pool_name}")
+        print()
+
+        try:
+            confirm = input(f"  ⚠ Confirm close? Type 'yes': ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled\n")
+            return
+
+        if confirm != 'yes':
+            print(f"  ✓ Continuing with {len(positions)} existing position(s)\n")
+            return
+
+        # Close selected positions
         print()
         closed = 0
-        for amm_id, pos in list(positions.items()):
+        for amm_id, pos in to_close:
             print(f"  🔄 Closing {pos.pool_name}...")
             success = self._exit_position(amm_id, "Manual close (startup)")
             if success:
@@ -896,7 +980,8 @@ class LiquidityBot:
         # Wait for on-chain state to settle before reading balance
         time.sleep(3)
         self._refresh_balance(force=True)
-        print(f"\n  ✓ Closed {closed} position(s)  |  Balance: {self._usd(self.available_capital, sol_price)}\n")
+        remaining = len(positions) - closed
+        print(f"\n  ✓ Closed {closed} position(s)  |  {remaining} remaining  |  Balance: {self._usd(self.available_capital, sol_price)}\n")
 
     def run(self):
         """Main bot loop — spawns worker threads and runs display in the main thread."""
