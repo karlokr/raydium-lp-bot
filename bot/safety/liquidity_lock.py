@@ -1,16 +1,34 @@
 """
-On-chain LP Lock Analysis
+On-chain LP Lock Analysis — CIRCULATING Supply Only
 
-Queries Solana RPC to determine what percentage of a pool's LP tokens are
-safely locked (burned, protocol-held, or in a time-lock contract) versus
-sitting in regular wallets where holders can rug-pull.
+Queries Solana RPC to analyze the distribution of **circulating** LP tokens:
+who holds them (regular wallets vs. protocol authorities vs. locker contracts)
+and whether any single wallet could pull significant liquidity.
+
+IMPORTANT — SPL Token Burn Mechanism:
+  Raydium's "Burn & Earn" uses the SPL Token `burn` instruction, which
+  **reduces total supply** — burned tokens cease to exist entirely.  They
+  are NOT sent to dead/null addresses.  Therefore:
+  - getTokenSupply() returns the CURRENT supply (after burns).
+  - getTokenLargestAccounts() returns holders of CURRENT supply only.
+  - This module's percentages are relative to circulating supply, not
+    the original amount minted at pool creation.
+  - The API-reported burnPercent (from the Raydium V3 API) captures the
+    burned portion.  pool_quality.py combines both to get the full picture.
 
 Flow:
-  1. getTokenSupply(lpMint)               → total LP supply
+  1. getTokenSupply(lpMint)               → circulating LP supply
   2. getTokenLargestAccounts(lpMint)       → top ~20 LP holders
   3. getMultipleAccounts(holder accounts)  → owner program IDs
   4. Classify each holder as burned/protocol-locked/contract-locked/unlocked
-  5. Return breakdown + safety verdict
+  5. Return breakdown + standalone safety verdict (see note on is_safe below)
+
+Note on is_safe / risks:
+  The standalone is_safe verdict only considers circulating supply.  A pool
+  where 99% of LP was SPL-burned will show safe_pct ≈ 0% and is_safe=False
+  here, even though the pool is actually very safe.  pool_quality.py combines
+  this module's output with the API burnPercent for the definitive verdict:
+    effective_safe_pct = burnPercent + safe_pct × (1 − burnPercent/100)
 """
 import time
 import requests
@@ -20,7 +38,11 @@ from bot.config import config
 
 # --- Well-known addresses for LP safety classification ---
 
-# Burned / dead addresses — LP tokens sent here are gone forever
+# Burned / dead addresses — LP tokens sent here are gone forever.
+# NOTE: Most Raydium LP burns use SPL Token `burn` (reduces supply, tokens
+# vanish).  These addresses only catch the rarer case of sending tokens to a
+# null/incinerator address.  SPL-instruction burns are captured by the API's
+# burnPercent, not by this set.
 BURN_ADDRESSES = {
     "1111111111111111111111111111111111111111111",   # Solana null address
     "1nc1nerator11111111111111111111111111111111",   # Common incinerator
@@ -47,7 +69,13 @@ TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
 
 class LiquidityLockAnalyzer:
-    """Analyze LP token distribution on-chain to assess rug-pull risk."""
+    """Analyze LP token distribution on-chain to assess rug-pull risk.
+
+    All percentages returned are relative to the CIRCULATING supply
+    (what getTokenSupply returns after any SPL Token burns).  The caller
+    (pool_quality.py) is responsible for combining these with the API's
+    burnPercent to derive the full-picture safety verdict.
+    """
 
     def __init__(self, rpc_url: str = None):
         self.rpc_url = rpc_url or config.RPC_ENDPOINT
@@ -90,18 +118,22 @@ class LiquidityLockAnalyzer:
         """
         Analyze LP token distribution for a given LP mint.
 
+        All percentages are relative to CIRCULATING supply (post-SPL-burns).
+        SPL Token burns reduce total supply, so burned tokens are invisible
+        here.  Use the API burnPercent + these results for the full picture.
+
         Returns:
             {
                 'available': bool,
-                'total_supply': int,          # raw lamports
-                'burned_pct': float,          # % burned (dead addresses)
+                'total_supply': int,          # raw lamports (circulating, post-burn)
+                'burned_pct': float,          # % at dead addresses (NOT SPL-instruction burns)
                 'protocol_locked_pct': float, # % held by Raydium authority
                 'contract_locked_pct': float, # % in known locker programs
                 'unlocked_pct': float,        # % in regular wallets
-                'safe_pct': float,            # burned + protocol + contract
-                'max_single_unlocked_pct': float,  # largest unlocked holder
+                'safe_pct': float,            # burned + protocol + contract (of circulating)
+                'max_single_unlocked_pct': float,  # largest unlocked holder (of circulating)
                 'top_holders': list,          # classified holder details
-                'is_safe': bool,              # passes thresholds
+                'is_safe': bool,              # standalone verdict (ignores SPL burns — see note)
                 'risks': list[str],           # reason(s) if not safe
             }
         """
@@ -216,14 +248,15 @@ class LiquidityLockAnalyzer:
         max_single_unlocked_pct = (max_single_unlocked / total_supply) * 100
 
         risks = []
-        if safe_pct < config.MIN_SAFE_LP_PERCENT:
+        if safe_pct < config.MIN_LP_LOCK_PERCENT:
             risks.append(
-                f"Only {safe_pct:.1f}% of remaining LP is locked "
-                f"(min: {config.MIN_SAFE_LP_PERCENT}%)"
+                f"Only {safe_pct:.1f}% of circulating LP is locked "
+                f"(min: {config.MIN_LP_LOCK_PERCENT}%); "
+                f"note: SPL-burned LP is not reflected here"
             )
         if max_single_unlocked_pct > config.MAX_SINGLE_LP_HOLDER_PERCENT:
             risks.append(
-                f"Single wallet holds {max_single_unlocked_pct:.1f}% of remaining LP "
+                f"Single wallet holds {max_single_unlocked_pct:.1f}% of circulating LP "
                 f"(max: {config.MAX_SINGLE_LP_HOLDER_PERCENT}%)"
             )
 
