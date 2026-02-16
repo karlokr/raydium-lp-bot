@@ -25,19 +25,6 @@ from bot.safety.rugcheck import RugCheckAPI
 from bot.safety.liquidity_lock import LiquidityLockAnalyzer
 from bot.raydium_client import WSOL_MINT
 
-# RugCheck danger risk names that are automatic hard rejections.
-# Any danger-level item rejects the pool, but these are the ones
-# we specifically look for and tag even outside the danger level.
-CRITICAL_RISK_PATTERNS = [
-    'top 10 holders',       # Top 10 holders high ownership
-    'single holder',        # Single holder owns large amount
-    'freeze authority',     # Token can be frozen
-    'mint authority',       # Infinite minting possible
-    'copycat',              # Copycat / impersonation token
-    'low liquidity',        # Low liquidity flagged by RugCheck
-    'rug pull',             # Explicit rug pull flag
-]
-
 
 class PoolQualityAnalyzer:
     """Analyzes pool quality using V3 API data and RugCheck."""
