@@ -229,22 +229,10 @@ class LiquidityBot:
         print(f"\n🧹 Found {len(ghosts)} ghost position(s) (LP=0 on-chain) — cleaning up...")
         for amm_id, pos in ghosts:
             print(f"  🔄 Cleaning ghost: {pos.pool_name}")
-            # Try to swap any remaining non-SOL tokens back (retry up to 3x)
+            # Try to swap any remaining non-SOL tokens back
             token_name = pos.pool_name.replace('WSOL/', '').replace('/WSOL', '')
-            for attempt, delay in enumerate([0, 3, 5], 1):
-                if delay:
-                    time.sleep(delay)
-                try:
-                    sig = self.executor.swap_tokens(
-                        pool_id=amm_id,
-                        amount_in=0,  # sell-all
-                        direction='sell',
-                    )
-                    if sig:
-                        time.sleep(2)
-                        break
-                except Exception:
-                    pass
+            self._retry_swap(amm_id, token_name)
+            time.sleep(2)
 
             sol_price = self.api_client.get_sol_price_usd()
             state.append_trade_history(pos, "Ghost cleanup (startup)", sol_price_usd=sol_price)
@@ -352,16 +340,7 @@ class LiquidityBot:
 
                 # Swap remaining tokens back to SOL — retry on transient RPC failures
                 token_name = name.replace('WSOL/', '').replace('/WSOL', '')
-                swap_ok = False
-                for attempt, delay in enumerate([0, 3, 5], 1):
-                    if delay:
-                        time.sleep(delay)
-                    print(f"🔄 Swapping all {token_name} → SOL..." + (f" (attempt {attempt}/3)" if attempt > 1 else ""))
-                    swap_sig = self.executor.swap_tokens(pool_id=pool_id, amount_in=0, direction='sell')
-                    if swap_sig:
-                        swap_ok = True
-                        break
-                if not swap_ok:
+                if not self._retry_swap(pool_id, token_name):
                     print(f"  ⚠ Could not sell {token_name} after 3 attempts — will retry via token sweep")
 
                 time.sleep(2)
@@ -640,24 +619,9 @@ class LiquidityBot:
                 print(f"⚠ No LP tokens found for {position.pool_name}")
 
             # Step 2: Swap all remaining non-SOL tokens back to SOL
-            # Retry up to 3 times — RPC failures here leave tokens stuck in wallet
-            import time as _time
-            _time.sleep(2)
+            time.sleep(2)
             token_name = position.pool_name.replace('WSOL/', '').replace('/WSOL', '')
-            swap_ok = False
-            for attempt, delay in enumerate([0, 3, 5], 1):
-                if delay:
-                    _time.sleep(delay)
-                print(f"🔄 Swapping all {token_name} → SOL..." + (f" (attempt {attempt}/3)" if attempt > 1 else ""))
-                sig = self.executor.swap_tokens(
-                    pool_id=amm_id,
-                    amount_in=0,  # sell-all mode
-                    direction='sell',
-                )
-                if sig:
-                    swap_ok = True
-                    break
-            if not swap_ok:
+            if not self._retry_swap(amm_id, token_name):
                 print(f"⚠ Could not sell {token_name} after 3 attempts — tokens may be stuck in wallet")
 
         sol_price = self.api_client.get_sol_price_usd()
@@ -705,6 +669,16 @@ class LiquidityBot:
         if sol_price > 0:
             return f"{sol_amount:.4f} SOL (${sol_amount * sol_price:.2f})"
         return f"{sol_amount:.4f} SOL"
+
+    def _retry_swap(self, pool_id: str, token_name: str, attempts: int = 3) -> bool:
+        """Retry selling all of a token back to SOL. Returns True on success."""
+        for attempt, delay in enumerate([0, 3, 5][:attempts], 1):
+            if delay:
+                time.sleep(delay)
+            print(f"🔄 Swapping all {token_name} → SOL..." + (f" (attempt {attempt}/{attempts})" if attempt > 1 else ""))
+            if self.executor.swap_tokens(pool_id=pool_id, amount_in=0, direction='sell'):
+                return True
+        return False
 
     def print_status(self):
         """Print bot status."""
@@ -1163,25 +1137,27 @@ class LiquidityBot:
                 return
 
         if not config.DRY_RUN and self.executor:
-            # Step 1: Swap half the SOL into the other token
-            token_name = pool.get('name', '').replace('WSOL/', '').replace('/WSOL', '')
-            print(f"\n🔄 Swapping {position.sol_amount:.6f} SOL → {token_name}...")
-            swap_sig = self.executor.swap_tokens(
-                pool_id=amm_id,
-                amount_in=position.sol_amount,
-                direction='buy',
-            )
-
-            if not swap_sig:
-                print(f"✗ Swap failed - removing position, trying next pool")
+            def _rollback(sell_back=False):
+                """Close the position, mark pool as failed, refresh balance."""
+                if sell_back:
+                    self.executor.swap_tokens(pool_id=amm_id, amount_in=0, direction='sell')
                 with self._state_lock:
                     self.position_manager.close_position(amm_id)
                     self._failed_pools.add(amm_id)
                 self._refresh_balance(force=True)
+
+            # Step 1: Swap half the SOL into the other token
+            token_name = pool.get('name', '').replace('WSOL/', '').replace('/WSOL', '')
+            print(f"\n🔄 Swapping {position.sol_amount:.6f} SOL → {token_name}...")
+            swap_sig = self.executor.swap_tokens(
+                pool_id=amm_id, amount_in=position.sol_amount, direction='buy',
+            )
+            if not swap_sig:
+                print(f"✗ Swap failed - removing position, trying next pool")
+                _rollback()
                 return
 
-            import time as _time
-            _time.sleep(2)
+            time.sleep(2)
 
             # Step 2: Add liquidity with both tokens
             print(f"🔄 Executing add liquidity transaction...")
@@ -1190,18 +1166,9 @@ class LiquidityBot:
                 token_a_amount=position.token_a_amount,
                 token_b_amount=position.token_b_amount,
             )
-
             if not add_result:
                 print(f"✗ Transaction failed - swapping back to SOL")
-                self.executor.swap_tokens(
-                    pool_id=amm_id,
-                    amount_in=0,
-                    direction='sell',
-                )
-                with self._state_lock:
-                    self.position_manager.close_position(amm_id)
-                    self._failed_pools.add(amm_id)
-                self._refresh_balance(force=True)
+                _rollback(sell_back=True)
                 return
 
             position.pool_data['entry_signature'] = add_result['signature']
@@ -1215,8 +1182,7 @@ class LiquidityBot:
 
                 lp_raw = 0
                 for attempt, delay in enumerate([2, 3, 5], 1):
-                    import time as _time
-                    _time.sleep(delay)
+                    time.sleep(delay)
                     lp_raw = self.executor.get_token_balance(lp_mint)
                     if lp_raw > 0:
                         break
@@ -1227,15 +1193,7 @@ class LiquidityBot:
                     print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
                 else:
                     print(f"  ✗ LP tokens not found on-chain after add — rolling back")
-                    self.executor.swap_tokens(
-                        pool_id=amm_id,
-                        amount_in=0,
-                        direction='sell',
-                    )
-                    with self._state_lock:
-                        self.position_manager.close_position(amm_id)
-                        self._failed_pools.add(amm_id)
-                    self._refresh_balance(force=True)
+                    _rollback(sell_back=True)
                     return
 
         self._refresh_balance(force=True)
