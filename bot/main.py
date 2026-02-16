@@ -692,6 +692,8 @@ class LiquidityBot:
         print(f"Active Positions: {summary['active_positions']}/{config.MAX_CONCURRENT_POSITIONS}")
         print(f"Deployed Capital: {self._usd(summary['total_deployed_sol'], sol_price)}")
         print(f"Available Capital: {self._usd(self.available_capital, sol_price)}")
+        total_wallet = summary['total_deployed_sol'] + self.available_capital
+        print(f"Total Wallet: {self._usd(total_wallet, sol_price)}")
         print(f"Total P&L: {self._usd(summary['total_pnl_sol'], sol_price)}")
         print(f"  ├─ Fees Earned: {self._usd(summary['total_fees_sol'], sol_price)}")
         print(f"  └─ Avg IL: {summary['avg_il_percent']:.2f}%")
