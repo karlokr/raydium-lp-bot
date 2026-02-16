@@ -119,23 +119,13 @@ class RugCheckAPI:
             elif level == 'warn':
                 warnings.append(display)
 
-        # Determine risk level from normalised score
-        if risk_score <= 10:
-            risk_level = 'low'
-        elif risk_score <= 40:
-            risk_level = 'medium'
-        else:
-            risk_level = 'high'
+        risk_level = 'low' if risk_score <= 10 else 'medium' if risk_score <= 40 else 'high'
 
-        # Top holder concentration (top 5, top 10, and largest single)
-        top_holders = report.get('topHolders', [])
-        top5_pct = 0.0
-        top10_pct = 0.0
-        max_single_pct = 0.0
-        if top_holders:
-            top5_pct = sum(h.get('pct', 0) for h in top_holders[:5])
-            top10_pct = sum(h.get('pct', 0) for h in top_holders[:10])
-            max_single_pct = max((h.get('pct', 0) for h in top_holders), default=0.0)
+        # Top holder concentration
+        pcts = [h.get('pct', 0) for h in (report.get('topHolders') or [])]
+        top5_pct = sum(pcts[:5])
+        top10_pct = sum(pcts[:10])
+        max_single_pct = max(pcts, default=0.0)
 
         return {
             'available': True,
