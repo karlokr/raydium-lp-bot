@@ -169,16 +169,16 @@ Discovery → Safety Check → Scoring → Entry → Monitoring (1s) → Smart E
 
 ```
 Pool enters evaluation
-  ├─→ V3 burnPercent ≥ 50%?        → NO  → REJECT
-  ├─→ On-chain LP lock ≥ 50%?      → NO  → REJECT
-  ├─→ RugCheck score ≤ 60?         → NO  → REJECT
-  ├─→ Any danger-level risks?      → YES → REJECT
-  └─→ All pass                     → Proceed to scoring
+  ├─→ V3 burnPercent ≥ 50%?                → NO  → REJECT
+  ├─→ Burned + locked ≥ 90% (combined)?    → NO  → REJECT
+  ├─→ RugCheck score ≤ 60?                 → NO  → REJECT
+  ├─→ Any danger-level risks?              → YES → REJECT
+  └─→ All pass                             → Proceed to scoring
 ```
 
-**Layer 1: LP Burn.** The V3 API `burnPercent` field verifies LP tokens were burned at pool creation.
+**Layer 1: LP Burn.** The V3 API `burnPercent` field verifies LP tokens were burned at pool creation (min 50%).
 
-**Layer 2: On-Chain LP Lock.** Queries Solana RPC to classify where remaining LP tokens are held: burned, protocol-locked, contract-locked (Streamflow, Jupiter Lock, Fluxbeam, Raydium LP Lock), or unlocked wallets.
+**Layer 2: On-Chain LP Lock.** Queries Solana RPC to classify where circulating LP tokens are held: burned, protocol-locked, contract-locked (Streamflow, Jupiter Lock, Fluxbeam, Raydium LP Lock), or unlocked wallets. Combined with burn percent, total must be ≥90%.
 
 **Layer 3: RugCheck Token Safety.** Token-level analysis via RugCheck API: `score_normalised` (0-100, lower = safer), holder concentration, freeze/mint authority detection. Any "danger" level risk is a hard rejection.
 
@@ -245,8 +245,9 @@ All settings in `bot/config.py`. The tables below cover the most important tunin
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `MIN_SAFE_LP_PERCENT` | `50.0` | Min % of LP that must be burned/locked |
-| `MAX_SINGLE_LP_HOLDER_PERCENT` | `25.0` | Max % single wallet can hold of unlocked LP |
+| `MIN_LP_LOCK_PERCENT` | `80.0` | Min % of circulating LP that must be locked (on-chain standalone check) |
+| `MIN_SAFE_LP_PERCENT` | `90.0` | Min % of total initial LP that must be safe (burned + locked combined) |
+| `MAX_SINGLE_LP_HOLDER_PERCENT` | `25.0` | Max % of total initial LP any single wallet can pull |
 
 ### Cooldowns & Blacklist
 
