@@ -18,6 +18,17 @@ Autonomously discovers, evaluates, and provides liquidity to high-yield Raydium 
 
 ---
 
+## Thank you for your support!
+
+Donations are graciously accepted for your continuing support in the development of this software and others.
+
+XMR: 8BwmJHCfeaL9z3f1DwjStW7i1bvwKPL8oXhDnfcXbjRNSQAxVk9PVFv74SoFWVGWEVVQDCfb1bTsa1S53KP18zrwVizUeqe
+BTC: bc1q3frlupheaz79v88t4hc8lgzfqwy4nekvc4gtj7
+ETH: 0x9038E310D0a6B8E7819A8b7c33E53ebCF6964eF9
+SOL: Gzea6q2aBmpUUPMwCcAUUPsxGqSua5k6HT8PaGHD3ewn
+
+---
+
 ## Project Structure
 
 ```
