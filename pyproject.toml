@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short -p no:anchorpy"
+markers = [
+    "integration: tests that hit real APIs / RPC (deselected by default)",
+]
