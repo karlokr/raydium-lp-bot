@@ -151,7 +151,7 @@ class PoolQualityAnalyzer:
                         warnings.append(f"Low holder count ({total_holders})")
 
                 else:
-                    warnings.append("RugCheck data unavailable for this token")
+                    risks.append("RugCheck data unavailable — cannot verify token safety")
 
         # --- Short-circuit: skip expensive LP lock RPC calls if already rejected ---
         if risks:
@@ -229,7 +229,7 @@ class PoolQualityAnalyzer:
                             f"(burned={burn_percent:.0f}% + locked={safe_pct*remaining_frac:.1f}%)"
                         )
                 else:
-                    warnings.append("On-chain LP lock data unavailable")
+                    risks.append("On-chain LP lock data unavailable — cannot verify lock safety")
 
         # Determine overall risk level
         if risks:
