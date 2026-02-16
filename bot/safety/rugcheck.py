@@ -25,29 +25,44 @@ class RugCheckAPI:
         self._cache_ttl = 300  # 5 minutes
 
     def get_token_report(self, mint_address: str) -> Optional[Dict]:
-        """Get full RugCheck report for a token, with caching."""
+        """Get full RugCheck report for a token, with caching and retries."""
         if mint_address in self._cache:
             cached_data, cached_time = self._cache[mint_address]
             if time.time() - cached_time < self._cache_ttl:
                 return cached_data
 
-        try:
-            url = f"{self.BASE_URL}/tokens/{mint_address}/report"
-            response = requests.get(url, timeout=10)
+        url = f"{self.BASE_URL}/tokens/{mint_address}/report"
+        max_retries = 2
 
-            if response.status_code == 200:
-                data = response.json()
-                self._cache[mint_address] = (data, time.time())
-                return data
-            elif response.status_code == 404:
-                return None
-            else:
-                print(f"RugCheck API error {response.status_code}: {mint_address}")
+        for attempt in range(1 + max_retries):
+            try:
+                response = requests.get(url, timeout=10)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    self._cache[mint_address] = (data, time.time())
+                    return data
+                elif response.status_code == 404:
+                    return None  # token not found, no point retrying
+                elif response.status_code == 429 or response.status_code >= 500:
+                    # Rate-limited or server error — retry after backoff
+                    if attempt < max_retries:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    print(f"RugCheck API error {response.status_code} after {max_retries + 1} attempts: {mint_address}")
+                    return None
+                else:
+                    print(f"RugCheck API error {response.status_code}: {mint_address}")
+                    return None
+
+            except requests.RequestException as e:
+                if attempt < max_retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                print(f"Error fetching RugCheck data after {max_retries + 1} attempts: {e}")
                 return None
 
-        except requests.RequestException as e:
-            print(f"Error fetching RugCheck data: {e}")
-            return None
+        return None
 
     def analyze_token_safety(self, mint_address: str) -> Dict:
         """
