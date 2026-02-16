@@ -1035,6 +1035,7 @@ class LiquidityBot:
         """Worker thread: check positions every 1s and trigger exits."""
         while self.running:
             try:
+                exits = []
                 with self._state_lock:
                     if self.position_manager.active_positions:
                         self.update_positions()
