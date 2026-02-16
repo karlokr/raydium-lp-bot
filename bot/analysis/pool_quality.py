@@ -8,8 +8,8 @@ Hard-reject criteria (any = pool rejected):
 - Any danger-level RugCheck risk item
 - RugCheck risk score > MAX_RUGCHECK_SCORE (default 50)
 - Token marked as rugged
-- Top 10 holders own > MAX_TOP10_HOLDER_PERCENT (default 45%)
-- Single holder owns > MAX_SINGLE_HOLDER_PERCENT (default 15%)
+- Top 10 holders own > MAX_TOP10_HOLDER_PERCENT (default 40%)
+- Single holder owns > MAX_SINGLE_HOLDER_PERCENT (default 25%)
 - Fewer than MIN_TOKEN_HOLDERS holders (default 100)
 - Token has mutable metadata (owner can change name/symbol)
 - Very few LP providers (liquidity can be pulled)
@@ -58,7 +58,7 @@ class PoolQualityAnalyzer:
             warnings.append(f"Moderate LP burn ({burn_percent:.1f}%)")
 
         # --- APR Sanity ---
-        if apr > 1000:
+        if apr > 2000:
             risks.append(f"Extreme APR ({apr:.1f}%) - likely fake/manipulated")
         elif apr > 200:
             warnings.append(f"Very high APR ({apr:.1f}%) - high volatility expected")
