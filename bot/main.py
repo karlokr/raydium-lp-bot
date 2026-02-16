@@ -510,8 +510,6 @@ class LiquidityBot:
             for amm_id, pos in self.position_manager.active_positions.items():
                 if pos.lp_mint:
                     batch_entries.append({'pool_id': amm_id, 'lp_mint': pos.lp_mint})
-                else:
-                    print(f"  ⚠ No lp_mint set for {pos.pool_name}")
 
             if batch_entries:
                 batch_results = self.executor.batch_get_lp_values(batch_entries)
