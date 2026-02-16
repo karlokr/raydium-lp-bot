@@ -274,22 +274,19 @@ class PositionManager:
 
     def check_exit_conditions(self) -> List[tuple]:
         """Check all positions for exit conditions."""
+        checks = [
+            ('should_exit_sl',   lambda p: f"⚠ Stop loss hit: {p.pool_name} (P&L: {p.pnl_percent:.2f}%)",   "Stop Loss"),
+            ('should_exit_tp',   lambda p: f"✓ Take profit hit: {p.pool_name} (P&L: {p.pnl_percent:.2f}%)", "Take Profit"),
+            ('should_exit_time', lambda p: f"⏰ Max hold time: {p.pool_name} ({p.time_held_hours:.1f}h)",    "Max Time"),
+            ('should_exit_il',   lambda p: f"⚠ High IL: {p.pool_name} ({p.current_il_percent:.2f}%)",       "High IL"),
+        ]
         to_close = []
-
-        for amm_id, position in self.active_positions.items():
-            if position.should_exit_sl:
-                print(f"⚠ Stop loss hit: {position.pool_name} (P&L: {position.pnl_percent:.2f}%)")
-                to_close.append((amm_id, "Stop Loss"))
-            elif position.should_exit_tp:
-                print(f"✓ Take profit hit: {position.pool_name} (P&L: {position.pnl_percent:.2f}%)")
-                to_close.append((amm_id, "Take Profit"))
-            elif position.should_exit_time:
-                print(f"⏰ Max hold time: {position.pool_name} ({position.time_held_hours:.1f}h)")
-                to_close.append((amm_id, "Max Time"))
-            elif position.should_exit_il:
-                print(f"⚠ High IL: {position.pool_name} ({position.current_il_percent:.2f}%)")
-                to_close.append((amm_id, "High IL"))
-
+        for amm_id, pos in self.active_positions.items():
+            for attr, msg_fn, reason in checks:
+                if getattr(pos, attr):
+                    print(msg_fn(pos))
+                    to_close.append((amm_id, reason))
+                    break
         return to_close
 
     def get_total_deployed_capital(self) -> float:
