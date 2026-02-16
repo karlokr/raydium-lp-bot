@@ -174,80 +174,47 @@ class LiquidityLockAnalyzer:
                                and a != RAYDIUM_LP_AUTHORITY]
         authority_owners = self._batch_get_authority_owners(authority_addresses)
 
-        burned_amount = 0
-        protocol_amount = 0
-        contract_amount = 0
-        unlocked_amount = 0
+        amounts = {'burned': 0, 'protocol_locked': 0, 'contract_locked': 0, 'unlocked': 0}
         max_single_unlocked = 0
         classified_holders = []
 
         for holder in holder_accounts:
-            address = holder['address']
-            amount_str = holder.get('amount', '0')
             try:
-                amount = int(amount_str)
+                amount = int(holder.get('amount', '0'))
             except (ValueError, TypeError):
                 continue
-
             if amount == 0:
                 continue
 
+            address = holder['address']
             owner = owner_map.get(address, 'unknown')
-            pct = (amount / total_supply) * 100
 
             # Classify based on the token authority
-            if address in BURN_ADDRESSES or owner in BURN_ADDRESSES:
+            if address in BURN_ADDRESSES or owner in BURN_ADDRESSES or owner == SYSTEM_PROGRAM:
                 category = 'burned'
-                burned_amount += amount
-            elif owner == SYSTEM_PROGRAM:
-                # Token account closed / authority is system program → burned
-                category = 'burned'
-                burned_amount += amount
             elif owner == RAYDIUM_LP_AUTHORITY:
                 category = 'protocol_locked'
-                protocol_amount += amount
-            elif owner in KNOWN_LOCKER_PROGRAMS:
-                # Authority IS a known locker program directly
+            elif owner in KNOWN_LOCKER_PROGRAMS or authority_owners.get(owner) in KNOWN_LOCKER_PROGRAMS:
                 category = 'contract_locked'
-                contract_amount += amount
-            elif authority_owners.get(owner) in KNOWN_LOCKER_PROGRAMS:
-                # Authority is a PDA owned by a known locker program
-                category = 'contract_locked'
-                contract_amount += amount
             else:
                 category = 'unlocked'
-                unlocked_amount += amount
-                if amount > max_single_unlocked:
-                    max_single_unlocked = amount
+                max_single_unlocked = max(max_single_unlocked, amount)
 
+            amounts[category] += amount
             classified_holders.append({
-                'address': address,
-                'owner': owner,
-                'amount': amount,
-                'pct': round(pct, 2),
-                'category': category,
+                'address': address, 'owner': owner, 'amount': amount,
+                'pct': round((amount / total_supply) * 100, 2), 'category': category,
             })
 
-        # The top ~20 accounts may not cover 100% of supply.
-        # Anything not in the top holders is by definition a small holder
-        # (individually low risk). Treat uncovered portion as unlocked
-        # but with no single-whale concern.
-        covered_amount = burned_amount + protocol_amount + contract_amount + unlocked_amount
-        uncovered_amount = total_supply - covered_amount
-        if uncovered_amount > 0:
-            unlocked_amount += uncovered_amount
+        # Uncovered supply (outside top ~20 holders) treated as unlocked
+        uncovered = total_supply - sum(amounts.values())
+        if uncovered > 0:
+            amounts['unlocked'] += uncovered
 
-        burned_pct = (burned_amount / total_supply) * 100
-        protocol_pct = (protocol_amount / total_supply) * 100
-        contract_pct = (contract_amount / total_supply) * 100
-        unlocked_pct = (unlocked_amount / total_supply) * 100
-        safe_pct = burned_pct + protocol_pct + contract_pct
+        pct = {k: (v / total_supply) * 100 for k, v in amounts.items()}
+        safe_pct = pct['burned'] + pct['protocol_locked'] + pct['contract_locked']
         max_single_unlocked_pct = (max_single_unlocked / total_supply) * 100
 
-        # Evaluate — note: this is the raw on-chain picture for REMAINING
-        # circulating LP only. The API's burnPercent should be combined
-        # with these numbers by the caller (pool_quality.py) for the
-        # full safety picture.
         risks = []
         if safe_pct < config.MIN_SAFE_LP_PERCENT:
             risks.append(
@@ -260,21 +227,19 @@ class LiquidityLockAnalyzer:
                 f"(max: {config.MAX_SINGLE_LP_HOLDER_PERCENT}%)"
             )
 
-        result = {
+        return {
             'available': True,
             'total_supply': total_supply,
-            'burned_pct': round(burned_pct, 2),
-            'protocol_locked_pct': round(protocol_pct, 2),
-            'contract_locked_pct': round(contract_pct, 2),
-            'unlocked_pct': round(unlocked_pct, 2),
+            'burned_pct': round(pct['burned'], 2),
+            'protocol_locked_pct': round(pct['protocol_locked'], 2),
+            'contract_locked_pct': round(pct['contract_locked'], 2),
+            'unlocked_pct': round(pct['unlocked'], 2),
             'safe_pct': round(safe_pct, 2),
             'max_single_unlocked_pct': round(max_single_unlocked_pct, 2),
             'top_holders': classified_holders,
             'is_safe': len(risks) == 0,
             'risks': risks,
         }
-
-        return result
 
     def _batch_get_account_owners(self, addresses: List[str]) -> Dict[str, str]:
         """
@@ -305,55 +270,25 @@ class LiquidityLockAnalyzer:
         accounts = result.get('value', [])
         for addr, acct in zip(addresses, accounts):
             if acct is None:
-                # Account doesn't exist on-chain — closed, likely burned
                 owner_map[addr] = SYSTEM_PROGRAM
             else:
-                # For SPL token accounts, the real authority is in
-                # data.parsed.info.owner (the wallet/PDA that controls it).
-                # The top-level acct['owner'] is always the Token Program.
                 data = acct.get('data', {})
-                if isinstance(data, dict) and 'parsed' in data:
-                    info = data['parsed'].get('info', {})
-                    token_authority = info.get('owner', 'unknown')
-                    owner_map[addr] = token_authority
-                else:
-                    # Fallback to program owner if not parsed
-                    owner_map[addr] = acct.get('owner', 'unknown')
+                info = data.get('parsed', {}).get('info', {}) if isinstance(data, dict) else {}
+                owner_map[addr] = info.get('owner') or acct.get('owner', 'unknown')
 
         return owner_map
 
     def _batch_get_authority_owners(self, authority_addresses: List[str]) -> Dict[str, str]:
-        """
-        For each token authority address, determine what program owns it.
-
-        This is the second-level lookup: if a token's authority is a PDA
-        (program-derived address), we check whether its on-chain account
-        is owned by a known locker program.
-
-        Returns {authority_address: owning_program_pubkey}.
-        Regular wallets will show System Program. PDAs will show their
-        parent program.
-        """
+        """For each authority address, get the owning program (locker detection)."""
         if not authority_addresses:
             return {}
-
         result = self._rpc_call(
             "getMultipleAccounts",
-            [
-                authority_addresses,
-                {"encoding": "base64", "commitment": "confirmed"},
-            ],
+            [authority_addresses, {"encoding": "base64", "commitment": "confirmed"}],
         )
         if not result:
             return {}
-
-        owner_map = {}
-        accounts = result.get('value', [])
-        for addr, acct in zip(authority_addresses, accounts):
-            if acct is None:
-                # No on-chain account — regular wallet (unfunded or system)
-                owner_map[addr] = SYSTEM_PROGRAM
-            else:
-                owner_map[addr] = acct.get('owner', 'unknown')
-
-        return owner_map
+        return {
+            addr: (SYSTEM_PROGRAM if acct is None else acct.get('owner', 'unknown'))
+            for addr, acct in zip(authority_addresses, result.get('value', []))
+        }
