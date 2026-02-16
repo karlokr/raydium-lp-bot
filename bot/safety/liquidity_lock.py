@@ -85,34 +85,48 @@ class LiquidityLockAnalyzer:
         self._rpc_min_interval: float = 0.2  # 200ms between RPC calls to avoid bursts
 
     def _rpc_call(self, method: str, params: list) -> Optional[Dict]:
-        """Make a single Solana JSON-RPC call with rate throttling."""
-        # Throttle: wait at least _rpc_min_interval between RPC calls
-        now = time.time()
-        elapsed = now - self._last_rpc_time
-        if elapsed < self._rpc_min_interval:
-            time.sleep(self._rpc_min_interval - elapsed)
+        """Make a single Solana JSON-RPC call with rate throttling and retries."""
+        max_retries = 2
 
-        try:
-            resp = requests.post(
-                self.rpc_url,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params,
-                },
-                timeout=15,
-            )
-            self._last_rpc_time = time.time()
-            resp.raise_for_status()
-            data = resp.json()
-            if "error" in data:
-                print(f"  ⚠ RPC error ({method}): {data['error']}")
+        for attempt in range(1 + max_retries):
+            # Throttle: wait at least _rpc_min_interval between RPC calls
+            now = time.time()
+            elapsed = now - self._last_rpc_time
+            if elapsed < self._rpc_min_interval:
+                time.sleep(self._rpc_min_interval - elapsed)
+
+            try:
+                resp = requests.post(
+                    self.rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": method,
+                        "params": params,
+                    },
+                    timeout=15,
+                )
+                self._last_rpc_time = time.time()
+                resp.raise_for_status()
+                data = resp.json()
+                if "error" in data:
+                    err = data['error']
+                    # Retry on server-side / rate-limit errors
+                    err_code = err.get('code', 0) if isinstance(err, dict) else 0
+                    if (err_code == 429 or err_code == -32005) and attempt < max_retries:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    print(f"  ⚠ RPC error ({method}): {err}")
+                    return None
+                return data.get("result")
+            except Exception as e:
+                if attempt < max_retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                print(f"  ⚠ RPC call failed ({method}) after {max_retries + 1} attempts: {e}")
                 return None
-            return data.get("result")
-        except Exception as e:
-            print(f"  ⚠ RPC call failed ({method}): {e}")
-            return None
+
+        return None
 
     def analyze_lp_lock(self, lp_mint: str) -> Dict:
         """
