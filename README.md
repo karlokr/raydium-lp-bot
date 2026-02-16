@@ -296,24 +296,50 @@ On every startup the bot automatically:
 
 ### Shutdown (`Ctrl+C`)
 
-Saves state and stops. **Positions remain open on-chain** and resume on next startup. To force-close all positions, use the startup prompt or `tests/manage_positions.py`.
+Saves state and stops. **Positions remain open on-chain** and resume on next startup. To force-close all positions, use the startup prompt or `python manage_positions.py`.
+
+---
+
+## Running
+
+```bash
+# Start the bot
+make start
+# — or —
+.venv/bin/python run.py
+```
+
+Run in paper trading mode (`DRY_RUN = True`) for 30-60 minutes before going live. See [docs/ENABLE_TRADING.md](docs/ENABLE_TRADING.md).
 
 ---
 
 ## Testing
 
+The test suite uses **pytest** with two tiers:
+
+| Tier | What it tests | Network? |
+|------|--------------|----------|
+| **Unit** | All modules, fully mocked | No |
+| **Integration** | Real Raydium API, RugCheck, Node.js bridge, on-chain reads | Yes |
+
 ```bash
-# Wallet & RPC connection
-./venv/bin/python tests/test_wallet.py
+# Run everything (unit + integration)
+make test
 
-# Pool discovery & scoring
-./venv/bin/python tests/test_trading.py
+# Unit tests only (fast, no network)
+make test-unit
 
-# Python ↔ Node.js bridge
-./venv/bin/python tests/test_bridge.py
+# Integration tests only (requires .env with RPC + wallet)
+make test-integration
+
+# Run a specific test file
+.venv/bin/python -m pytest tests/test_config.py -v
+
+# Run a single test
+.venv/bin/python -m pytest tests/test_pool_analyzer.py::TestCalculatePoolScore::test_high_score -v
 ```
 
-Run in paper trading mode (`DRY_RUN = True`) for 30-60 minutes before going live. See [docs/ENABLE_TRADING.md](docs/ENABLE_TRADING.md).
+> **Note:** Integration tests are marked with `@pytest.mark.integration` and require network access plus a valid `.env` file. They are included in `make test` but excluded from `make test-unit`.
 
 ---
 
