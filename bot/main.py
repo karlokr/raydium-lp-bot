@@ -737,9 +737,14 @@ class LiquidityBot:
                 print(f"    Entry: {entry_str}  →  Value: {value_str}  |  P&L: {pos.unrealized_pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)  |  IL: {il_str}{exit_str}")
 
                 # Token price line
+                # priceRatio = quote/base (mintB/mintA). When sol_is_base,
+                # that's tokens-per-SOL — invert to get SOL-per-token.
                 if pos.current_price_ratio > 0:
                     token_name = pos.pool_name.replace("WSOL/", "").replace("/WSOL", "")
-                    price_sol = pos.current_price_ratio
+                    if pos.sol_is_base:
+                        price_sol = 1.0 / pos.current_price_ratio
+                    else:
+                        price_sol = pos.current_price_ratio
                     price_usd = price_sol * sol_price if sol_price > 0 else 0
                     # Auto-format: use scientific notation for tiny prices
                     if price_sol < 0.0001:
