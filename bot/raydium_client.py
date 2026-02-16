@@ -34,40 +34,19 @@ class RaydiumAPIClient:
         self._jupiter_api_key: str = os.getenv('JUPITER_API_KEY', '')
 
     def get_sol_price_usd(self) -> float:
-        """Get current SOL/USD price.
-
-        Tries Jupiter Price API v3 first (requires JUPITER_API_KEY in .env).
-        Falls back to CoinGecko free API if Jupiter is unavailable.
-        Cached for 60 seconds. Returns last known price on failure.
-        """
-        current_time = time.time()
-        if self._sol_price_usd > 0 and current_time - self._sol_price_timestamp < self._sol_price_ttl:
+        """Get current SOL/USD price (Jupiter → CoinGecko fallback, cached 60s)."""
+        now = time.time()
+        if self._sol_price_usd > 0 and now - self._sol_price_timestamp < self._sol_price_ttl:
             return self._sol_price_usd
 
-        # Try Jupiter first (if API key is set)
-        if self._jupiter_api_key:
-            price = self._fetch_price_jupiter()
+        for fetch in (self._fetch_price_jupiter, self._fetch_price_coingecko):
+            price = fetch()
             if price > 0:
                 self._sol_price_usd = price
-                self._sol_price_timestamp = current_time
-                return self._sol_price_usd
+                self._sol_price_timestamp = now
+                return price
 
-        # Fallback to CoinGecko (no API key required)
-        price = self._fetch_price_coingecko()
-        if price > 0:
-            self._sol_price_usd = price
-            self._sol_price_timestamp = current_time
-            return self._sol_price_usd
-
-        # If both fail and no Jupiter key, try Jupiter without key as last resort
-        if not self._jupiter_api_key:
-            price = self._fetch_price_jupiter()
-            if price > 0:
-                self._sol_price_usd = price
-                self._sol_price_timestamp = current_time
-                return self._sol_price_usd
-
-        return self._sol_price_usd  # return last known price
+        return self._sol_price_usd  # last known price
 
     def _fetch_price_jupiter(self) -> float:
         """Fetch SOL/USD from Jupiter Price API v3."""
