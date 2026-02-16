@@ -35,9 +35,17 @@ class BotConfig:
     MIN_TOKEN_HOLDERS: int = 100  # Reject tokens with fewer holders (thin markets = easy to manipulate)
 
     # LP Lock Safety (on-chain analysis of LP token distribution)
+    # NOTE: On-chain analysis only sees CIRCULATING supply (SPL-burned tokens
+    # vanish from supply).  pool_quality.py combines burn + lock for the
+    # definitive safety verdict.
+    #
+    # Mathematical relationship (at worst-case MIN_BURN_PERCENT):
+    #   MIN_BURN + MIN_LP_LOCK × (1 - MIN_BURN/100) = MIN_SAFE_LP
+    #   50       + 80          × 0.5                 = 90
     CHECK_LP_LOCK: bool = True  # Check on-chain LP holder distribution
-    MIN_SAFE_LP_PERCENT: float = 50.0  # Min % of LP that must be safely locked (burned + protocol + contract)
-    MAX_SINGLE_LP_HOLDER_PERCENT: float = 25.0  # Reject if any single wallet holds more than this % of unlocked LP
+    MIN_LP_LOCK_PERCENT: float = 80.0  # Min % of CIRCULATING LP that must be locked (liquidity_lock module standalone)
+    MIN_SAFE_LP_PERCENT: float = 90.0  # Min % of TOTAL initial LP that must be safe (burned + locked combined)
+    MAX_SINGLE_LP_HOLDER_PERCENT: float = 25.0  # Max % of TOTAL initial LP any single wallet can pull
 
     # Position Sizing
     MAX_ABSOLUTE_POSITION_SOL: float = 5.0  # Hard cap per position in SOL
