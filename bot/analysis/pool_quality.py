@@ -16,7 +16,7 @@ Hard-reject criteria (any = pool rejected):
 - Token has freeze or mint authority
 - LP burn < 50%
 - Low TVL + extreme APR (rug pull pattern)
-- On-chain LP lock < MIN_SAFE_LP_PERCENT (default 50%)
+- On-chain LP lock < MIN_SAFE_LP_PERCENT (default 90%)
 - Single wallet holds > MAX_SINGLE_LP_HOLDER_PERCENT (default 25%) of unlocked LP
 """
 from typing import Dict, List
@@ -52,8 +52,8 @@ class PoolQualityAnalyzer:
         burn_percent = pool.get('burnPercent', 0)
 
         # --- LP Burn Check (from V3 API - real data!) ---
-        if burn_percent < 50:
-            risks.append(f"Low LP burn ({burn_percent:.1f}%) - rug pull risk")
+        if burn_percent < config.MIN_BURN_PERCENT:
+            risks.append(f"Low LP burn ({burn_percent:.1f}%, min: {config.MIN_BURN_PERCENT}%) - rug pull risk")
         elif burn_percent < 80:
             warnings.append(f"Moderate LP burn ({burn_percent:.1f}%)")
 
@@ -167,16 +167,28 @@ class PoolQualityAnalyzer:
             }
 
         # --- On-chain LP Lock Analysis ---
-        # burnPercent (from API) = what % of initial LP was destroyed at creation.
-        # On-chain LP lock = of the REMAINING circulating LP, who controls it?
+        # Raydium's "Burn & Earn" uses SPL Token `burn`, which REDUCES total
+        # supply — burned tokens cease to exist.  They are NOT sent to dead
+        # addresses, so they're invisible to on-chain holder queries.
         #
-        # Combined risk: what % of the pool's TOTAL initial liquidity can
-        # a single wallet pull?  = max_single_unlocked_pct x (1 - burnPercent/100)
+        # burnPercent (from Raydium V3 API) = what % of initial LP was
+        #   destroyed via SPL Token burn instruction.
+        # On-chain LP lock (from liquidity_lock.py) = of the CIRCULATING
+        #   (post-burn) LP tokens, who controls them?  All percentages from
+        #   that module are relative to circulating supply.
         #
-        # Example: burnPercent=99%, top holder has 50% of remaining LP
-        #   -> they can pull 50% x 1% = 0.5% of total liquidity (negligible)
-        # Example: burnPercent=50%, top holder has 60% of remaining LP
-        #   -> they can pull 60% x 50% = 30% of total liquidity (dangerous)
+        # To convert on-chain %-of-circulating into %-of-total-initial:
+        #   remaining_frac = (100 - burnPercent) / 100
+        #   on_chain_pct_of_total = on_chain_pct × remaining_frac
+        #
+        # Combined risk formula:
+        #   effective_safe = burnPercent + safe_pct_of_circulating × remaining_frac
+        #   max_pullable   = max_single_unlocked_of_circulating × remaining_frac
+        #
+        # Example: burnPercent=99%, top holder has 50% of circulating LP
+        #   -> they can pull 50% × 1% = 0.5% of total liquidity (negligible)
+        # Example: burnPercent=50%, top holder has 60% of circulating LP
+        #   -> they can pull 60% × 50% = 30% of total liquidity (dangerous)
         lp_lock_result = None
         if check_safety and config.CHECK_LP_LOCK:
             lp_mint_info = pool.get('lpMint', {})
@@ -184,9 +196,10 @@ class PoolQualityAnalyzer:
             if lp_mint_addr:
                 lp_lock_result = self.lp_lock.analyze_lp_lock(lp_mint_addr)
                 if lp_lock_result.get('available'):
+                    # Convert on-chain %-of-circulating to %-of-total-initial
                     remaining_frac = (100 - burn_percent) / 100  # fraction of initial LP still circulating
-                    max_single_unlocked = lp_lock_result.get('max_single_unlocked_pct', 0)
-                    safe_pct = lp_lock_result.get('safe_pct', 0)
+                    max_single_unlocked = lp_lock_result.get('max_single_unlocked_pct', 0)  # % of circulating
+                    safe_pct = lp_lock_result.get('safe_pct', 0)  # % of circulating locked on-chain
 
                     # What % of TOTAL initial pool liquidity can the biggest holder pull?
                     max_pullable_pct = max_single_unlocked * remaining_frac
@@ -197,8 +210,8 @@ class PoolQualityAnalyzer:
                     if max_pullable_pct > config.MAX_SINGLE_LP_HOLDER_PERCENT:
                         risks.append(
                             f"LP whale can pull {max_pullable_pct:.1f}% of pool liquidity "
-                            f"({max_single_unlocked:.0f}% of remaining LP × "
-                            f"{remaining_frac*100:.1f}% circulating, "
+                            f"({max_single_unlocked:.0f}% of circulating LP × "
+                            f"{remaining_frac*100:.1f}% still circulating, "
                             f"max allowed: {config.MAX_SINGLE_LP_HOLDER_PERCENT}%)"
                         )
 
