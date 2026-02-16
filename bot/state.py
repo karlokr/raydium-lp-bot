@@ -184,21 +184,31 @@ def load_trade_history() -> List[dict]:
 
 def save_state(
     positions: Dict,
-    exit_cooldowns: Dict[str, float],
+    exit_cooldowns: Dict[str, tuple],
     failed_pools: set,
     snapshot_tracker=None,
     last_scan_pools: List[dict] = None,
+    stop_loss_strikes: Dict[str, int] = None,
+    permanent_blacklist: set = None,
 ):
     """Save complete bot state to disk.
 
     Args:
         positions: Dict of amm_id -> Position (from PositionManager)
-        exit_cooldowns: Dict of amm_id -> timestamp
+        exit_cooldowns: Dict of amm_id -> (timestamp, duration)
         failed_pools: Set of pool IDs that failed
         snapshot_tracker: Optional SnapshotTracker instance
         last_scan_pools: Optional list of top-ranked pools from last scan
+        stop_loss_strikes: Dict of amm_id -> consecutive stop-loss count
+        permanent_blacklist: Set of permanently blacklisted amm_ids
     """
     _ensure_dir()
+
+    # Serialize cooldowns as [timestamp, duration] lists for JSON
+    serializable_cooldowns = {
+        k: list(v) if isinstance(v, tuple) else [v, 86400]
+        for k, v in exit_cooldowns.items()
+    }
 
     state = {
         'saved_at': datetime.now().isoformat(),
@@ -207,12 +217,14 @@ def save_state(
             amm_id: position_to_dict(pos)
             for amm_id, pos in positions.items()
         },
-        'exit_cooldowns': exit_cooldowns,
+        'exit_cooldowns': serializable_cooldowns,
         'failed_pools': list(failed_pools),
         'snapshots': snapshots_to_dict(snapshot_tracker) if snapshot_tracker else {},
         'last_scan_pools': [
             _sanitize_pool_data(p) for p in (last_scan_pools or [])
         ],
+        'stop_loss_strikes': stop_loss_strikes or {},
+        'permanent_blacklist': list(permanent_blacklist or set()),
     }
 
     # Write atomically (write to tmp then rename)
@@ -260,6 +272,8 @@ def load_state() -> Optional[dict]:
             'last_scan_pools': state.get('last_scan_pools', []),
             'saved_at': state.get('saved_at', ''),
             'saved_timestamp': state.get('saved_timestamp', 0),
+            'stop_loss_strikes': state.get('stop_loss_strikes', {}),
+            'permanent_blacklist': state.get('permanent_blacklist', []),
         }
 
     except Exception as e:

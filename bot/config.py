@@ -51,7 +51,12 @@ class BotConfig:
     TAKE_PROFIT_PERCENT: float = 20.0  # Exit if up 20% (capture bigger swings)
     MAX_HOLD_TIME_HOURS: int = 24  # Force exit after 24 hours
     MAX_IMPERMANENT_LOSS: float = -5.0  # Exit if IL exceeds 5%
-    EXIT_COOLDOWN_SEC: int = 86400  # Don't re-enter a pool for 24 h after exiting at a loss
+    STOP_LOSS_COOLDOWNS: list = None  # Escalating cooldowns per consecutive stop loss [24h, 48h]
+    PERMANENT_BLACKLIST_STRIKES: int = 3  # Permanently blacklist after this many consecutive stop losses
+
+    def __post_init__(self):
+        if self.STOP_LOSS_COOLDOWNS is None:
+            self.STOP_LOSS_COOLDOWNS = [86400, 172800]  # [24h, 48h] in seconds
 
     # Trading Settings
     TRADING_ENABLED: bool = True  # Set to True to enable real transactions
@@ -60,7 +65,8 @@ class BotConfig:
 
     # Monitoring
     POOL_SCAN_INTERVAL_SEC: int = 180  # Scan for new pools every 3 minutes
-    POSITION_CHECK_INTERVAL_SEC: int = 4  # Check positions every 4 seconds
+    POSITION_CHECK_INTERVAL_SEC: int = 1  # Check positions every 1 second (threaded)
+    DISPLAY_INTERVAL_SEC: int = 4  # Refresh status display every 4 seconds
 
     # Safety
     ENABLE_EMERGENCY_EXIT: bool = True  # Allow manual override

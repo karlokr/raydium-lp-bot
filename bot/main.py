@@ -1,10 +1,20 @@
 """
 Main bot orchestration and monitoring loop
+
+Threading architecture:
+  - Main thread: display only (prints status every N seconds)
+  - Position check thread: updates positions & detects exits (every 1s)
+  - Pool scan thread: scans & ranks pools, queues buy orders
+  - Buy worker thread: executes buy orders sequentially from a queue
+  - Sell: exits are executed in parallel via ThreadPoolExecutor
 """
 import signal
 import time
 import sys
+import threading
+import queue
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List
 
@@ -42,9 +52,17 @@ class LiquidityBot:
         self.last_position_check = 0
         self.last_status_print = 0
         self._failed_pools = set()  # Track pools that failed to avoid retrying
-        self._exit_cooldowns: dict = {}  # amm_id -> timestamp of loss exit (cooldown)
+        self._exit_cooldowns: dict = {}  # amm_id -> (timestamp, cooldown_duration)
+        self._stop_loss_strikes: dict = {}  # amm_id -> consecutive stop-loss count
+        self._permanent_blacklist: set = set()  # amm_ids permanently banned (loaded from state)
         self._last_scan_pools: list = []  # Top-ranked pools from last scan
         self._last_balance_refresh = 0.0  # Timestamp of last RPC balance read
+
+        # Threading infrastructure
+        self._state_lock = threading.Lock()  # Protects shared mutable state
+        self._buy_queue: queue.Queue = queue.Queue()  # Pool dicts to enter
+        self._threads: dict = {}  # name -> Thread
+        self._selling = threading.Event()  # Set while a sell batch is in progress
 
         # Restore state from disk FIRST — positions must be known
         # before LP recovery so we don't accidentally exit them
@@ -144,12 +162,23 @@ class LiquidityBot:
         # Restore exit cooldowns (skip expired ones)
         now = time.time()
         cooldowns = saved.get('exit_cooldowns', {})
-        self._exit_cooldowns = {
-            k: v for k, v in cooldowns.items()
-            if now - v < config.EXIT_COOLDOWN_SEC
-        }
+        self._exit_cooldowns = {}
+        for k, v in cooldowns.items():
+            # Support both old format (float timestamp) and new format ([timestamp, duration])
+            if isinstance(v, (list, tuple)):
+                ts, dur = v
+            else:
+                ts, dur = v, 86400  # legacy: assume 24h
+            if now - ts < dur:
+                self._exit_cooldowns[k] = (ts, dur)
         if self._exit_cooldowns:
             print(f"  ✓ Restored {len(self._exit_cooldowns)} exit cooldown(s)")
+
+        # Restore stop-loss strike counts and permanent blacklist
+        self._stop_loss_strikes = saved.get('stop_loss_strikes', {})
+        self._permanent_blacklist = set(saved.get('permanent_blacklist', []))
+        if self._permanent_blacklist:
+            print(f"  ✓ Restored {len(self._permanent_blacklist)} permanently blacklisted pool(s)")
 
         # Restore failed pools
         self._failed_pools = saved.get('failed_pools', set())
@@ -173,6 +202,8 @@ class LiquidityBot:
             failed_pools=self._failed_pools,
             snapshot_tracker=self.snapshot_tracker,
             last_scan_pools=self._last_scan_pools,
+            stop_loss_strikes=self._stop_loss_strikes,
+            permanent_blacklist=self._permanent_blacklist,
         )
 
     def _cleanup_ghost_positions(self):
@@ -629,182 +660,31 @@ class LiquidityBot:
             self._refresh_balance(force=True)
             # Clean up snapshot history for this pool
             self.snapshot_tracker.clear_pool(amm_id)
-            # Cooldown: don't re-enter pools we exited at a loss
-            if reason in ("Stop Loss", "High IL"):
-                self._exit_cooldowns[amm_id] = time.time()
-                print(f"  🕐 Cooldown: {reason} exit — won't re-enter for {config.EXIT_COOLDOWN_SEC // 3600}h")
-            # Persist state after exit
-            self._save_state()
-        return success
+            # Escalating cooldown on stop losses; reset on take profit
+            with self._state_lock:
+                if reason in ("Stop Loss", "High IL"):
+                    strikes = self._stop_loss_strikes.get(amm_id, 0) + 1
+                    self._stop_loss_strikes[amm_id] = strikes
 
-    def check_and_execute_exits(self):
-        """Check exit conditions and close positions."""
-        exits = self.position_manager.check_exit_conditions()
-
-        for amm_id, reason in exits:
-            self._exit_position(amm_id, reason)
-
-    def look_for_new_entries(self, top_pools: list):
-        """Look for new entry opportunities. Pools are already sorted by score (best first).
-        Position sizes are pre-computed from the initial balance so they're equal."""
-        self._refresh_balance(force=True)
-
-        if not self.position_manager.can_open_position(self.available_capital):
-            return
-
-        # Snapshot the total wallet balance — this is the truth for sizing.
-        # RPC getBalance after entries can be inflated (WSOL accounts, ATA rent
-        # that still shows as lamports, etc.), so we track committed capital
-        # ourselves instead of re-querying.
-        initial_balance = self.available_capital
-        committed = 0.0
-
-        active_amm_ids = set(self.position_manager.active_positions.keys())
-        failed_amm_ids = getattr(self, '_failed_pools', set())
-
-        # Expire old cooldowns and collect active ones
-        now = time.time()
-        expired = [k for k, t in self._exit_cooldowns.items() if now - t > config.EXIT_COOLDOWN_SEC]
-        for k in expired:
-            del self._exit_cooldowns[k]
-        cooldown_ids = set(self._exit_cooldowns.keys())
-
-        available_pools = [
-            p for p in top_pools
-            if p['ammId'] not in active_amm_ids
-            and p['ammId'] not in failed_amm_ids
-            and p['ammId'] not in cooldown_ids
-        ]
-
-        if not available_pools:
-            return
-
-        # Don't even try if we can't afford the minimum position size
-        deployable = initial_balance - config.RESERVE_SOL
-        if deployable < config.MIN_POSITION_SOL:
-            return
-
-        for rank, pool in enumerate(available_pools):
-            tracked_capital = initial_balance - committed
-
-            if not self.position_manager.can_open_position(tracked_capital):
-                break
-
-            if tracked_capital <= config.RESERVE_SOL:
-                print(f"⚠ Tracked capital ({tracked_capital:.4f} SOL) at reserve floor "
-                      f"({config.RESERVE_SOL:.4f} SOL) — not entering new positions")
-                break
-
-            if pool['score'] < 50:
-                continue
-
-            print(f"\n💡 Entry opportunity: {pool['name']} "
-                  f"(score: {pool['score']:.1f}, rank #{rank + 1}/{len(available_pools)})")
-
-            current_price = self.price_tracker.get_current_price(
-                pool['ammId'],
-                pool
-            )
-
-            if current_price <= 0:
-                print(f"⚠ Could not get valid price for {pool['name']}, skipping")
-                continue
-
-            position = self.position_manager.open_position(
-                pool,
-                tracked_capital,
-                current_price,
-                sol_price_usd=self.api_client.get_sol_price_usd(),
-                total_wallet_balance=initial_balance,
-                rank=rank,
-                total_ranked=len(available_pools),
-            )
-
-            if not position:
-                continue
-
-            amm_id = pool['ammId']
-
-            if not config.DRY_RUN and self.executor:
-                # Step 1: Swap half the SOL into the other token
-                token_name = pool.get('name', '').replace('WSOL/', '').replace('/WSOL', '')
-                print(f"\n🔄 Swapping {position.sol_amount:.6f} SOL → {token_name}...")
-                swap_sig = self.executor.swap_tokens(
-                    pool_id=amm_id,
-                    amount_in=position.sol_amount,
-                    direction='buy',
-                )
-
-                if not swap_sig:
-                    print(f"✗ Swap failed - removing position, trying next pool")
-                    self.position_manager.close_position(amm_id)
-                    self._failed_pools.add(amm_id)
-                    self._refresh_balance(force=True)
-                    continue
-
-                # Brief delay for on-chain state to settle
-                import time as _time
-                _time.sleep(2)
-
-                # Step 2: Add liquidity with both tokens
-                print(f"🔄 Executing add liquidity transaction...")
-                add_result = self.executor.add_liquidity(
-                    pool_id=amm_id,
-                    token_a_amount=position.token_a_amount,
-                    token_b_amount=position.token_b_amount,
-                )
-
-                if not add_result:
-                    print(f"✗ Transaction failed - swapping back to SOL")
-                    self.executor.swap_tokens(
-                        pool_id=amm_id,
-                        amount_in=0,  # sell all available
-                        direction='sell',
-                    )
-                    self.position_manager.close_position(amm_id)
-                    self._failed_pools.add(amm_id)
-                    self._refresh_balance(force=True)
-                    continue
-
-                position.pool_data['entry_signature'] = add_result['signature']
-
-                # Track LP token balance — retry with backoff since on-chain
-                # state may not be immediately visible after tx confirmation
-                lp_mint = add_result.get('lpMint', '')
-                if lp_mint:
-                    position.lp_mint = lp_mint
-                    lp_decimals = pool.get('lpDecimals', 9)
-                    position.lp_decimals = lp_decimals
-
-                    lp_raw = 0
-                    for attempt, delay in enumerate([2, 3, 5], 1):
-                        import time as _time
-                        _time.sleep(delay)
-                        lp_raw = self.executor.get_token_balance(lp_mint)
-                        if lp_raw > 0:
-                            break
-                        print(f"  ⏳ LP balance not yet visible (attempt {attempt}/3)...")
-
-                    if lp_raw > 0:
-                        position.lp_token_amount = lp_raw / (10 ** lp_decimals)
-                        print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
+                    if strikes >= config.PERMANENT_BLACKLIST_STRIKES:
+                        self._permanent_blacklist.add(amm_id)
+                        self._stop_loss_strikes.pop(amm_id, None)
+                        self._exit_cooldowns.pop(amm_id, None)
+                        pool_name = position.pool_name if position else amm_id[:8]
+                        print(f"  🚫 PERMANENT BLACKLIST: {pool_name} — {strikes} consecutive stop losses")
                     else:
-                        # LP tokens never appeared — roll back
-                        print(f"  ✗ LP tokens not found on-chain after add — rolling back")
-                        self.executor.swap_tokens(
-                            pool_id=amm_id,
-                            amount_in=0,
-                            direction='sell',
-                        )
-                        self.position_manager.close_position(amm_id)
-                        self._failed_pools.add(amm_id)
-                        self._refresh_balance(force=True)
-                        continue
-
-            # Track committed capital ourselves — don't trust RPC balance
-            committed += position.position_size_sol
-            self._refresh_balance(force=True)
-            self._save_state()
+                        idx = min(strikes - 1, len(config.STOP_LOSS_COOLDOWNS) - 1)
+                        cooldown_sec = config.STOP_LOSS_COOLDOWNS[idx]
+                        self._exit_cooldowns[amm_id] = (time.time(), cooldown_sec)
+                        print(f"  🕐 Cooldown: {reason} exit (strike {strikes}/{config.PERMANENT_BLACKLIST_STRIKES}) — won't re-enter for {cooldown_sec // 3600}h")
+                elif reason == "Take Profit":
+                    # Take profit resets the strike counter
+                    if amm_id in self._stop_loss_strikes:
+                        print(f"  ✅ Take profit — reset stop-loss strikes for this pool")
+                        del self._stop_loss_strikes[amm_id]
+                # Persist state after exit
+                self._save_state()
+        return success
 
     @staticmethod
     def _usd(sol_amount: float, sol_price: float) -> str:
@@ -1032,7 +912,7 @@ class LiquidityBot:
         print(f"\n  ✓ Closed {closed} position(s)  |  Balance: {self._usd(self.available_capital, sol_price)}\n")
 
     def run(self):
-        """Main bot loop."""
+        """Main bot loop — spawns worker threads and runs display in the main thread."""
         self.running = True
 
         # Show existing positions and let user close them before starting
@@ -1046,44 +926,312 @@ class LiquidityBot:
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
 
-        print("\n🚀 Starting bot main loop...")
+        print("\n🚀 Starting bot (threaded)...")
+        print("  • Position check thread: every %ds" % config.POSITION_CHECK_INTERVAL_SEC)
+        print("  • Pool scan thread: every %ds" % config.POOL_SCAN_INTERVAL_SEC)
+        print("  • Buy worker thread: sequential queue")
+        print("  • Main thread: display every %ds" % config.DISPLAY_INTERVAL_SEC)
         print("Press Ctrl+C to stop\n")
 
+        # Start worker threads (all daemon so they die with main thread)
+        self._threads['position_check'] = threading.Thread(
+            target=self._position_check_loop, name='position-check', daemon=True)
+        self._threads['pool_scan'] = threading.Thread(
+            target=self._pool_scan_loop, name='pool-scan', daemon=True)
+        self._threads['buy_worker'] = threading.Thread(
+            target=self._buy_worker_loop, name='buy-worker', daemon=True)
+
+        for t in self._threads.values():
+            t.start()
+
+        # Main thread: display only
         try:
-            iteration = 0
-            top_pools = []
             while self.running:
-                iteration += 1
                 current_time = time.time()
-
-                if current_time - self.last_pool_scan >= config.POOL_SCAN_INTERVAL_SEC:
-                    top_pools = self.scan_and_rank_pools()
-                    self.last_pool_scan = current_time
-                    self._failed_pools.clear()  # Reset failed pools on new scan
-
-                    # Only look for new entries right after a fresh scan —
-                    # don't re-enter stale pool data after mid-cycle exits
-                    if top_pools:
-                        self.look_for_new_entries(top_pools)
-
-                if current_time - self.last_position_check >= config.POSITION_CHECK_INTERVAL_SEC:
-                    self.update_positions()
-                    self.check_and_execute_exits()
-                    self.last_position_check = current_time
-
-                if current_time - self.last_status_print >= config.POSITION_CHECK_INTERVAL_SEC:
+                if current_time - self.last_status_print >= config.DISPLAY_INTERVAL_SEC:
                     self.print_status()
                     self.last_status_print = current_time
-
-                time.sleep(1)
+                time.sleep(0.5)
 
         except KeyboardInterrupt:
             print("\n\n⚠ Shutdown signal received...")
             self.shutdown()
 
+    # ── Thread workers ──────────────────────────────────────────────
+
+    def _position_check_loop(self):
+        """Worker thread: check positions every 1s and trigger exits."""
+        while self.running:
+            try:
+                with self._state_lock:
+                    if self.position_manager.active_positions:
+                        self.update_positions()
+                        exits = self.position_manager.check_exit_conditions()
+
+                if exits:
+                    self._execute_exits_parallel(exits)
+
+            except Exception as e:
+                print(f"⚠ Position check error: {e}")
+
+            time.sleep(1)
+
+    def _pool_scan_loop(self):
+        """Worker thread: scan for pools and queue buy orders."""
+        while self.running:
+            try:
+                current_time = time.time()
+                if current_time - self.last_pool_scan >= config.POOL_SCAN_INTERVAL_SEC:
+                    top_pools = self.scan_and_rank_pools()
+                    self.last_pool_scan = current_time
+
+                    with self._state_lock:
+                        self._failed_pools.clear()
+
+                    if top_pools:
+                        self._queue_new_entries(top_pools)
+
+            except Exception as e:
+                print(f"⚠ Pool scan error: {e}")
+
+            time.sleep(1)
+
+    def _buy_worker_loop(self):
+        """Worker thread: execute buy orders sequentially from the queue."""
+        while self.running:
+            try:
+                # Block with timeout so we can check self.running
+                pool = self._buy_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            try:
+                self._execute_single_entry(pool)
+            except Exception as e:
+                print(f"⚠ Buy worker error for {pool.get('name', '?')}: {e}")
+            finally:
+                self._buy_queue.task_done()
+
+    def _execute_exits_parallel(self, exits: list):
+        """Sell all triggered positions in parallel."""
+        if not exits:
+            return
+
+        self._selling.set()
+        try:
+            if len(exits) == 1:
+                # Single exit — no need for thread pool overhead
+                amm_id, reason = exits[0]
+                self._exit_position(amm_id, reason)
+            else:
+                print(f"\n⚡ Executing {len(exits)} exits in parallel...")
+                with ThreadPoolExecutor(max_workers=len(exits)) as executor:
+                    futures = {
+                        executor.submit(self._exit_position, amm_id, reason): (amm_id, reason)
+                        for amm_id, reason in exits
+                    }
+                    for future in as_completed(futures):
+                        amm_id, reason = futures[future]
+                        try:
+                            success = future.result()
+                            if not success:
+                                pos = self.position_manager.active_positions.get(amm_id)
+                                name = pos.pool_name if pos else amm_id[:8]
+                                print(f"  ✗ Failed to exit {name}")
+                        except Exception as e:
+                            print(f"  ✗ Exit error for {amm_id[:8]}: {e}")
+        finally:
+            self._selling.clear()
+
+    def _queue_new_entries(self, top_pools: list):
+        """Evaluate pools and queue buy orders (called from scan thread)."""
+        self._refresh_balance(force=True)
+
+        with self._state_lock:
+            if not self.position_manager.can_open_position(self.available_capital):
+                return
+
+            initial_balance = self.available_capital
+            committed = 0.0
+
+            active_amm_ids = set(self.position_manager.active_positions.keys())
+            failed_amm_ids = self._failed_pools.copy()
+
+            # Expire old cooldowns
+            now = time.time()
+            expired = [k for k, (ts, dur) in self._exit_cooldowns.items() if now - ts > dur]
+            for k in expired:
+                del self._exit_cooldowns[k]
+            cooldown_ids = set(self._exit_cooldowns.keys())
+            blacklist = self._permanent_blacklist.copy()
+
+        # Also exclude anything already queued
+        queued_ids = set()
+        for item in list(self._buy_queue.queue):
+            queued_ids.add(item.get('ammId', ''))
+
+        available_pools = [
+            p for p in top_pools
+            if p['ammId'] not in active_amm_ids
+            and p['ammId'] not in failed_amm_ids
+            and p['ammId'] not in cooldown_ids
+            and p['ammId'] not in blacklist
+            and p['ammId'] not in queued_ids
+        ]
+
+        if not available_pools:
+            return
+
+        deployable = initial_balance - config.RESERVE_SOL
+        if deployable < config.MIN_POSITION_SOL:
+            return
+
+        for rank, pool in enumerate(available_pools):
+            tracked_capital = initial_balance - committed
+
+            with self._state_lock:
+                if not self.position_manager.can_open_position(tracked_capital):
+                    break
+
+            if tracked_capital <= config.RESERVE_SOL:
+                break
+
+            if pool['score'] < 50:
+                continue
+
+            # Pre-compute position sizing so the buy worker has it
+            pool['_entry_meta'] = {
+                'tracked_capital': tracked_capital,
+                'initial_balance': initial_balance,
+                'rank': rank,
+                'total_ranked': len(available_pools),
+            }
+
+            self._buy_queue.put(pool)
+            committed += (tracked_capital - config.RESERVE_SOL) / max(1,
+                config.MAX_CONCURRENT_POSITIONS - len(active_amm_ids) - rank)
+
+    def _execute_single_entry(self, pool: dict):
+        """Execute a single buy (called sequentially by the buy worker thread)."""
+        meta = pool.pop('_entry_meta', {})
+        tracked_capital = meta.get('tracked_capital', self.available_capital)
+        initial_balance = meta.get('initial_balance', self.available_capital)
+        rank = meta.get('rank', 0)
+        total_ranked = meta.get('total_ranked', 1)
+
+        # Re-check that we can still open
+        with self._state_lock:
+            self._refresh_balance(force=True)
+            if not self.position_manager.can_open_position(self.available_capital):
+                return
+            tracked_capital = self.available_capital
+
+        amm_id = pool['ammId']
+
+        print(f"\n💡 Entry opportunity: {pool['name']} "
+              f"(score: {pool['score']:.1f}, rank #{rank + 1}/{total_ranked})")
+
+        current_price = self.price_tracker.get_current_price(amm_id, pool)
+        if current_price <= 0:
+            print(f"⚠ Could not get valid price for {pool['name']}, skipping")
+            return
+
+        with self._state_lock:
+            position = self.position_manager.open_position(
+                pool,
+                tracked_capital,
+                current_price,
+                sol_price_usd=self.api_client.get_sol_price_usd(),
+                total_wallet_balance=initial_balance,
+                rank=rank,
+                total_ranked=total_ranked,
+            )
+            if not position:
+                return
+
+        if not config.DRY_RUN and self.executor:
+            # Step 1: Swap half the SOL into the other token
+            token_name = pool.get('name', '').replace('WSOL/', '').replace('/WSOL', '')
+            print(f"\n🔄 Swapping {position.sol_amount:.6f} SOL → {token_name}...")
+            swap_sig = self.executor.swap_tokens(
+                pool_id=amm_id,
+                amount_in=position.sol_amount,
+                direction='buy',
+            )
+
+            if not swap_sig:
+                print(f"✗ Swap failed - removing position, trying next pool")
+                with self._state_lock:
+                    self.position_manager.close_position(amm_id)
+                    self._failed_pools.add(amm_id)
+                self._refresh_balance(force=True)
+                return
+
+            import time as _time
+            _time.sleep(2)
+
+            # Step 2: Add liquidity with both tokens
+            print(f"🔄 Executing add liquidity transaction...")
+            add_result = self.executor.add_liquidity(
+                pool_id=amm_id,
+                token_a_amount=position.token_a_amount,
+                token_b_amount=position.token_b_amount,
+            )
+
+            if not add_result:
+                print(f"✗ Transaction failed - swapping back to SOL")
+                self.executor.swap_tokens(
+                    pool_id=amm_id,
+                    amount_in=0,
+                    direction='sell',
+                )
+                with self._state_lock:
+                    self.position_manager.close_position(amm_id)
+                    self._failed_pools.add(amm_id)
+                self._refresh_balance(force=True)
+                return
+
+            position.pool_data['entry_signature'] = add_result['signature']
+
+            # Track LP token balance
+            lp_mint = add_result.get('lpMint', '')
+            if lp_mint:
+                position.lp_mint = lp_mint
+                lp_decimals = pool.get('lpDecimals', 9)
+                position.lp_decimals = lp_decimals
+
+                lp_raw = 0
+                for attempt, delay in enumerate([2, 3, 5], 1):
+                    import time as _time
+                    _time.sleep(delay)
+                    lp_raw = self.executor.get_token_balance(lp_mint)
+                    if lp_raw > 0:
+                        break
+                    print(f"  ⏳ LP balance not yet visible (attempt {attempt}/3)...")
+
+                if lp_raw > 0:
+                    position.lp_token_amount = lp_raw / (10 ** lp_decimals)
+                    print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
+                else:
+                    print(f"  ✗ LP tokens not found on-chain after add — rolling back")
+                    self.executor.swap_tokens(
+                        pool_id=amm_id,
+                        amount_in=0,
+                        direction='sell',
+                    )
+                    with self._state_lock:
+                        self.position_manager.close_position(amm_id)
+                        self._failed_pools.add(amm_id)
+                    self._refresh_balance(force=True)
+                    return
+
+        self._refresh_balance(force=True)
+        with self._state_lock:
+            self._save_state()
+
     def shutdown(self):
-        """Graceful shutdown — save state and stop. Positions stay open on-chain
-        and will be resumed on the next run."""
+        """Graceful shutdown — stop all threads, save state.
+        Positions stay open on-chain and will be resumed on next run."""
         if self._shutting_down:
             print("\n⚠ Already shutting down... please wait")
             return
@@ -1095,8 +1243,22 @@ class LiquidityBot:
         print("\nShutting down bot...")
         self.running = False
 
+        # Wait for worker threads to finish (daemon threads, but be polite)
+        for name, t in self._threads.items():
+            t.join(timeout=5)
+            if t.is_alive():
+                print(f"  ⚠ Thread '{name}' did not stop in time")
+
+        # Drain buy queue
+        while not self._buy_queue.empty():
+            try:
+                self._buy_queue.get_nowait()
+            except queue.Empty:
+                break
+
         # Always save state — preserves cooldowns, snapshots, scan history
-        self._save_state()
+        with self._state_lock:
+            self._save_state()
         n = len(self.position_manager.active_positions)
         if n > 0:
             names = [p.pool_name for p in self.position_manager.active_positions.values()]
