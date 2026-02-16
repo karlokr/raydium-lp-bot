@@ -40,25 +40,17 @@ class PriceTracker:
         return 0
 
     def _price_from_pool(self, pool: Dict) -> float:
-        """Extract price from pool data."""
-        # Try reserve ratio first
+        """Extract price from pool data (reserve ratio preferred, then price field)."""
         try:
-            mint_a = float(pool.get('mintAmountA', 0))
-            mint_b = float(pool.get('mintAmountB', 0))
+            mint_a, mint_b = float(pool.get('mintAmountA', 0)), float(pool.get('mintAmountB', 0))
             if mint_a > 0 and mint_b > 0:
                 return mint_b / mint_a
         except (ValueError, TypeError):
             pass
-
-        # Fall back to price field
         try:
-            price = float(pool.get('price', 0))
-            if price > 0:
-                return price
+            return max(0.0, float(pool.get('price', 0)))
         except (ValueError, TypeError):
-            pass
-
-        return 0
+            return 0.0
 
     def get_current_prices_batch(self, positions: Dict) -> Dict[str, float]:
         """Get current prices for all active positions."""
