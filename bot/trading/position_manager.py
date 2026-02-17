@@ -1,6 +1,7 @@
 """
 Position Manager - Entry/Exit Logic and Tracking
 """
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -35,6 +36,12 @@ class Position:
     lp_mint: str = ""
     lp_token_amount: float = 0.0  # raw LP tokens held
     lp_decimals: int = 0
+
+    # Entry value tracking
+    entry_lp_value_sol: float = 0.0   # actual LP value right after entry (may differ from position_size_sol due to swap slippage)
+
+    # Re-evaluation tracking (safety re-check every 24h)
+    last_reeval_time: str = ""  # ISO timestamp of last safety re-evaluation
 
     # Tracking
     current_price_ratio: float = 0.0
@@ -75,6 +82,21 @@ class Position:
         return (self.unrealized_pnl_sol / self.position_size_sol) * 100
 
     @property
+    def entry_slippage_sol(self) -> float:
+        """SOL lost to swap slippage on entry (always >= 0).
+        Returns 0 if entry LP value was never recorded."""
+        if self.entry_lp_value_sol <= 0:
+            return 0.0
+        return max(0.0, self.position_size_sol - self.entry_lp_value_sol)
+
+    @property
+    def entry_slippage_percent(self) -> float:
+        """Entry slippage as a percentage of position size."""
+        if self.position_size_sol <= 0:
+            return 0.0
+        return (self.entry_slippage_sol / self.position_size_sol) * 100
+
+    @property
     def should_exit_sl(self) -> bool:
         return self.pnl_percent <= config.STOP_LOSS_PERCENT
 
@@ -89,6 +111,19 @@ class Position:
     @property
     def should_exit_il(self) -> bool:
         return self.current_il_percent <= config.MAX_IMPERMANENT_LOSS
+
+    @property
+    def needs_reeval(self) -> bool:
+        """True if position needs a safety re-evaluation (every 24h)."""
+        if not self.last_reeval_time:
+            # Never re-evaluated yet; check if we've been held > interval
+            return self.time_held_hours >= config.POSITION_REEVAL_INTERVAL_HOURS
+        try:
+            last = datetime.fromisoformat(self.last_reeval_time)
+            hours_since = (datetime.now() - last).total_seconds() / 3600
+            return hours_since >= config.POSITION_REEVAL_INTERVAL_HOURS
+        except (ValueError, TypeError):
+            return True
 
     def update_metrics(self, current_price: float, pool_data: Dict,
                         lp_value_sol: float = None):
@@ -122,9 +157,34 @@ class Position:
                 # Real PnL from on-chain LP token value
                 self.current_lp_value_sol = lp_value_sol
                 self.unrealized_pnl_sol = lp_value_sol - self.position_size_sol
-                # Back-derive fees: pnl = fees + il_loss => fees = pnl - il_loss
-                il_loss_sol = (self.current_il_percent / 100) * self.position_size_sol
-                self.fees_earned_sol = self.unrealized_pnl_sol - il_loss_sol
+
+                # Back-derive fees using the LP return factor.
+                # For a CPMM, the LP value (in SOL, excluding fees) changes by:
+                #   sol_is_base:  factor = 1 / sqrt(r)
+                #   sol_is_quote: factor = sqrt(r)
+                # where r = current_price_ratio / entry_price_ratio.
+                #
+                # fees = current_lp_value - entry_baseline * factor
+                # This correctly separates:
+                #   - token price exposure (captured in factor)
+                #   - divergence loss / IL  (captured in factor)
+                #   - fee income (the residual)
+                #
+                # If entry_lp_value_sol is not yet set (first reading), skip fee calc.
+                if self.entry_lp_value_sol > 0:
+                    if self.entry_price_ratio > 0 and self.current_price_ratio > 0:
+                        r = self.current_price_ratio / self.entry_price_ratio
+                        if self.sol_is_base:
+                            lp_return_factor = 1.0 / math.sqrt(r)
+                        else:
+                            lp_return_factor = math.sqrt(r)
+                        no_fee_value = self.entry_lp_value_sol * lp_return_factor
+                        self.fees_earned_sol = lp_value_sol - no_fee_value
+                    else:
+                        self.fees_earned_sol = 0.0
+                else:
+                    # First reading before entry_lp_value_sol is recorded
+                    self.fees_earned_sol = 0.0
         else:
             # No on-chain data available — keep last known PnL values
             # (they'll be refreshed next cycle when the bridge responds)
@@ -301,6 +361,7 @@ class PositionManager:
         total_deployed = self.get_total_deployed_capital()
         total_pnl = sum(pos.unrealized_pnl_sol for pos in self.active_positions.values())
         total_fees = sum(pos.fees_earned_sol for pos in self.active_positions.values())
+        total_slippage = sum(pos.entry_slippage_sol for pos in self.active_positions.values())
         avg_il = (
             sum(pos.current_il_percent for pos in self.active_positions.values())
             / len(self.active_positions)
@@ -312,5 +373,6 @@ class PositionManager:
             'total_deployed_sol': total_deployed,
             'total_pnl_sol': total_pnl,
             'total_fees_sol': total_fees,
+            'total_slippage_sol': total_slippage,
             'avg_il_percent': avg_il,
         }
