@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Dict, List
 
 from bot.config import config
-from bot.raydium_client import RaydiumAPIClient
+from bot.raydium_client import RaydiumAPIClient, RAYDIUM_V4_PROGRAM
 from bot.trading.executor import RaydiumExecutor
 from bot.analysis.pool_analyzer import PoolAnalyzer
 from bot.trading.position_manager import PositionManager
@@ -119,7 +119,7 @@ class LiquidityBot:
         print(f"Max Positions: {config.MAX_CONCURRENT_POSITIONS}")
         print(f"Stop Loss: {config.STOP_LOSS_PERCENT}%")
         print(f"Take Profit: {config.TAKE_PROFIT_PERCENT}%")
-        print(f"Max Hold Time: {config.MAX_HOLD_TIME_HOURS}h")
+        print(f"Max Hold Time: {config.MAX_HOLD_TIME_HOURS}h ({config.MAX_HOLD_TIME_HOURS / 24:.0f}d)  |  Re-eval: every {config.POSITION_REEVAL_INTERVAL_HOURS}h")
         print(f"Min LP Burn: {config.MIN_BURN_PERCENT}%")
         print("=" * 60)
 
@@ -413,7 +413,7 @@ class LiquidityBot:
 
                 # Only use V4 AMM pools (our bridge only supports this program)
                 program = pool.get('programId', '')
-                if program and program != '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8':
+                if program and program != RAYDIUM_V4_PROGRAM:
                     print(f"  ⚠ Pool for {mint[:8]}... is not AMM V4 — skipping")
                     continue
 
@@ -462,10 +462,27 @@ class LiquidityBot:
             analyzer=self.quality_analyzer,
         )
 
-        top_pools = self.analyzer.rank_pools(safe_pools, top_n=10)
+        # Enrich safe pools with daily OHLCV candles for multi-period Parkinson σ
+        if safe_pools:
+            print(f"  Fetching daily candles for {len(safe_pools)} safe pools...")
+            self.api_client.enrich_pools_with_candles(safe_pools, days=7)
 
-        print(f"  Found {len(pools)} qualifying pools (burn≥{config.MIN_BURN_PERCENT}%)")
-        print(f"  Safe pools after quality check: {len(safe_pools)}")
+        # Compute the position size the bot would use for the next entry
+        sol_price_usd = self.api_client.get_sol_price_usd()
+        position_sol = self.analyzer.calculate_position_size(
+            {}, self.available_capital,
+            len(self.position_manager.active_positions))
+
+        top_pools = self.analyzer.rank_pools(
+            safe_pools, top_n=10,
+            position_sol=position_sol, sol_price_usd=sol_price_usd)
+
+        print(f"  Pools after API filters: {len(pools)} "
+              f"(TVL≥${config.MIN_LIQUIDITY_USD:,.0f}, APR≥{config.MIN_APR_24H:.0f}%, "
+              f"burn≥{config.MIN_BURN_PERCENT:.0f}%)")
+        print(f"  Safe after RugCheck + LP lock: {len(safe_pools)}")
+        print(f"  Investable (net APR≥{config.MIN_PREDICTED_NET_APR:.0f}%, "
+              f"slip-profitable for {position_sol:.2f} SOL): {len(top_pools)}")
         print(f"  Snapshot tracker: {self.snapshot_tracker.pool_count()} pools tracked")
         if top_pools:
             best = top_pools[0]
@@ -481,12 +498,15 @@ class LiquidityBot:
                         age_str = f", age: {age_days:.0f}d"
                 except (ValueError, TypeError):
                     pass
+            net_sol = best.get('_pred_net_sol', 0)
+            slip_sol = best.get('_pred_slip_sol', 0)
+            hold_d = best.get('_pred_hold_days', 7)
+            sigma = best.get('_pred_sigma', 0)
             print(f"  Top pool: {best['name']} (score: {best['score']:.1f}, "
                   f"burn: {best.get('burnPercent', 0):.0f}%, "
-                  f"mom: {best.get('_momentum', 0):.0f}, "
-                  f"IL: {best.get('_il_safety', 0):.0f}, "
-                  f"fresh: {best.get('_freshness', 0):.0f}, "
-                  f"vel: {best.get('_velocity', 0):.0f}{age_str})")
+                  f"net: {net_sol:+.4f} SOL/{hold_d:.0f}d "
+                  f"[yield {best.get('_pred_yield_pct', 0):.3f} - LVR {best.get('_pred_lvr_pct', 0):.3f} "
+                  f"- slip {slip_sol:.4f} | σ={sigma:.1%}]{age_str})")
 
         # Persist scan results to disk
         self._last_scan_pools = top_pools
@@ -698,6 +718,9 @@ class LiquidityBot:
         # Calculate P&L percentage (relative to deployed capital)
         pnl_pct = (summary['total_pnl_sol'] / summary['total_deployed_sol'] * 100) if summary['total_deployed_sol'] > 0 else 0.0
         print(f"Total P&L: {self._usd(summary['total_pnl_sol'], sol_price)} ({pnl_pct:+.2f}%)")
+        total_slip = summary.get('total_slippage_sol', 0)
+        if total_slip > 0.0001:
+            print(f"  ├─ Entry Slip: -{total_slip:.4f} SOL")
         print(f"  ├─ Fees Earned: {self._usd(summary['total_fees_sol'], sol_price)}")
         print(f"  └─ Avg IL: {summary['avg_il_percent']:.2f}%")
 
@@ -715,8 +738,18 @@ class LiquidityBot:
                 # Time info
                 hours_held = pos.time_held_hours
                 time_left = max(0, config.MAX_HOLD_TIME_HOURS - hours_held)
-                time_str = f"{hours_held:.1f}h" if hours_held < 1 else f"{hours_held:.0f}h"
-                time_left_str = f"{time_left:.0f}h left" if time_left >= 1 else f"{time_left * 60:.0f}m left"
+                if hours_held < 1:
+                    time_str = f"{hours_held * 60:.0f}m"
+                elif hours_held < 24:
+                    time_str = f"{hours_held:.1f}h"
+                else:
+                    time_str = f"{hours_held / 24:.1f}d"
+                if time_left >= 24:
+                    time_left_str = f"{time_left / 24:.1f}d left"
+                elif time_left >= 1:
+                    time_left_str = f"{time_left:.0f}h left"
+                else:
+                    time_left_str = f"{time_left * 60:.0f}m left"
 
                 # Format values
                 entry_str = self._usd(pos.position_size_sol, sol_price)
@@ -740,6 +773,10 @@ class LiquidityBot:
                 # (a 5% price change = only 0.03% IL)
                 il_str = f"{pos.current_il_percent:.4f}%" if abs(pos.current_il_percent) < 1.0 else f"{pos.current_il_percent:.2f}%"
                 print(f"    Entry: {entry_str}  →  Value: {value_str}  |  P&L: {pos.unrealized_pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)  |  IL: {il_str}{exit_str}")
+                # Show entry slippage if significant
+                slip = pos.entry_slippage_sol
+                if slip > 0.0001:
+                    print(f"    Slip: -{slip:.4f} SOL (-{pos.entry_slippage_percent:.1f}%)  |  Fees: {pos.fees_earned_sol:+.4f} SOL")
 
                 # Token price line
                 # priceRatio = quote/base (mintB/mintA). When sol_is_base,
@@ -836,7 +873,12 @@ class LiquidityBot:
                 time_str = f"{hours_held:.1f}h"
             else:
                 time_str = f"{hours_held / 24:.1f}d"
-            time_left_str = f"{time_left:.0f}h left" if time_left >= 1 else f"{time_left * 60:.0f}m left"
+            if time_left >= 24:
+                time_left_str = f"{time_left / 24:.1f}d left"
+            elif time_left >= 1:
+                time_left_str = f"{time_left:.0f}h left"
+            else:
+                time_left_str = f"{time_left * 60:.0f}m left"
 
             il_pct = pos.current_il_percent
             il_str = f"{il_pct:.4f}%" if abs(il_pct) < 1.0 else f"{il_pct:.2f}%"
@@ -858,6 +900,12 @@ class LiquidityBot:
                 print(f"  Value: — (could not fetch)")
             pnl_usd = f" (${pnl_sol * sol_price:.2f})" if sol_price > 0 and lp_value > 0 else ""
             print(f"  P&L:   {pnl_sol:+.4f} SOL{pnl_usd} ({pnl_pct:+.2f}%)")
+            # Show entry slippage and fees breakdown
+            slip = pos.entry_slippage_sol
+            if slip > 0.0001:
+                print(f"  Slip:  -{slip:.4f} SOL (-{pos.entry_slippage_percent:.1f}%)  |  Fees: {pos.fees_earned_sol:+.4f} SOL")
+            else:
+                print(f"  Fees:  {pos.fees_earned_sol:+.4f} SOL")
             print(f"  IL:    {il_str}  |  Price: {price_arrow} {price_chg:+.1f}%")
             print(f"  Held:  {time_str} ({time_left_str})  |  LP: {lp_human:.6f}"
                   + ("" if lp_balance_raw > 0 else " ⚠ not found on-chain"))
@@ -1069,6 +1117,10 @@ class LiquidityBot:
                         self.update_positions()
                         exits = self.position_manager.check_exit_conditions()
 
+                        # 24h safety re-evaluation: re-run full safety pipeline
+                        reeval_exits = self._check_position_reevals()
+                        exits.extend(reeval_exits)
+
                 if exits:
                     self._execute_exits_parallel(exits)
 
@@ -1076,6 +1128,36 @@ class LiquidityBot:
                 print(f"⚠ Position check error: {e}")
 
             time.sleep(1)
+
+    def _check_position_reevals(self) -> list:
+        """Re-evaluate positions every 24h through the full safety pipeline.
+
+        If a position's pool now fails safety checks (RugCheck, LP lock,
+        holder concentration, etc.), schedule it for early exit.
+        Called inside _state_lock.
+        """
+        from datetime import datetime as _dt
+        exits = []
+        for amm_id, pos in self.position_manager.active_positions.items():
+            if not pos.needs_reeval:
+                continue
+            # Re-run safety analysis on the stored pool data
+            pool = pos.pool_data
+            if not pool:
+                pos.last_reeval_time = _dt.now().isoformat()
+                continue
+            analysis = self.quality_analyzer.analyze_pool(
+                pool, check_safety=config.CHECK_TOKEN_SAFETY)
+            if analysis['is_safe']:
+                pos.last_reeval_time = _dt.now().isoformat()
+                print(f"\u2705 Re-eval PASS: {pos.pool_name} "
+                      f"(held {pos.time_held_hours:.0f}h, "
+                      f"next check in {config.POSITION_REEVAL_INTERVAL_HOURS}h)")
+            else:
+                risks = ', '.join(analysis['risks'][:2])
+                print(f"\u26a0 Re-eval FAIL: {pos.pool_name} — {risks}")
+                exits.append((amm_id, 'Safety Re-eval'))
+        return exits
 
     def _pool_scan_loop(self):
         """Worker thread: scan for pools and queue buy orders."""
@@ -1197,9 +1279,6 @@ class LiquidityBot:
             if tracked_capital <= config.RESERVE_SOL:
                 break
 
-            if pool['score'] < 50:
-                continue
-
             # Pre-compute position sizing so the buy worker has it
             pool['_entry_meta'] = {
                 'tracked_capital': tracked_capital,
@@ -1305,6 +1384,31 @@ class LiquidityBot:
                 if lp_raw > 0:
                     position.lp_token_amount = lp_raw / (10 ** lp_decimals)
                     print(f"  LP tokens received: {position.lp_token_amount:.6f} (mint: {lp_mint[:8]}...)")
+
+                    # Query actual LP value in SOL right after entry.
+                    # This captures entry slippage (swap + add liquidity losses).
+                    time.sleep(2)
+                    lp_data = self.executor.get_lp_value_sol(amm_id, lp_mint)
+                    if lp_data and lp_data.get('valueSol', 0) > 0:
+                        entry_lp_val = lp_data['valueSol']
+                        position.entry_lp_value_sol = entry_lp_val
+                        position.current_lp_value_sol = entry_lp_val
+                        slippage = position.entry_slippage_sol
+                        slip_pct = position.entry_slippage_percent
+                        if slip_pct > 1.0:
+                            print(f"  ⚠ Entry slippage: {slippage:.4f} SOL ({slip_pct:.1f}%) — LP worth {entry_lp_val:.4f} vs {position.position_size_sol:.4f} sent")
+                        else:
+                            print(f"  ✓ Entry LP value: {entry_lp_val:.4f} SOL (slippage: {slip_pct:.1f}%)")
+
+                        # Update on-chain price if available
+                        chain_price = lp_data.get('priceRatio', 0)
+                        if chain_price > 0:
+                            position.entry_price_ratio = chain_price
+                            position.current_price_ratio = chain_price
+                    else:
+                        # Couldn't query LP value — use position_size as fallback
+                        position.entry_lp_value_sol = position.position_size_sol
+                        print(f"  ⚠ Could not query entry LP value — using cost basis as estimate")
                 else:
                     print(f"  ✗ LP tokens not found on-chain after add — rolling back")
                     _rollback(sell_back=True)
