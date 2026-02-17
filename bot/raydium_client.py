@@ -3,9 +3,13 @@ Raydium V3 API Client with caching
 
 Uses the V3 mint-filtered endpoint which provides:
 - burnPercent (LP burn data)
-- Nested day/week/month stats (apr, volume, feeApr)
+- Nested day/week/month stats (apr, volume, feeApr, volumeFee)
 - Proper mint objects with symbol/name/decimals
-- Paginated results (no 704k dead pool downloads)
+- Paginated results with sort by fee24h (direct fee yield signal)
+
+Available poolSortField values (V3 /pools/info/mint):
+  default, liquidity, volume24h, fee24h, apr24h,
+  volume7d, fee7d, apr7d, volume30d, fee30d, apr30d
 """
 import os
 import time
@@ -16,11 +20,16 @@ from bot.config import config
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+# Raydium V4 AMM program — the only pool type our bridge supports.
+# CPMM (CPMMoo8L...) and CLMM have different on-chain layouts.
+RAYDIUM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+
 
 class RaydiumAPIClient:
     """Client for Raydium V3 API with caching and WSOL-pair filtering."""
 
     BASE_URL = "https://api-v3.raydium.io"
+    GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
     JUPITER_PRICE_URL = "https://api.jup.ag/price/v3"
     COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 
@@ -32,6 +41,10 @@ class RaydiumAPIClient:
         self._sol_price_timestamp: float = 0
         self._sol_price_ttl: float = 60  # refresh every 60s
         self._jupiter_api_key: str = os.getenv('JUPITER_API_KEY', '')
+        # GeckoTerminal OHLCV cache: {pool_id: ([(high,low),...], timestamp)}
+        self._ohlcv_cache: Dict[str, tuple] = {}
+        self._ohlcv_cache_ttl: float = 6 * 3600  # 6h — daily candles don't change fast
+        self._last_gecko_call: float = 0
 
     def get_sol_price_usd(self) -> float:
         """Get current SOL/USD price (Jupiter → CoinGecko fallback, cached 60s)."""
@@ -110,61 +123,38 @@ class RaydiumAPIClient:
             return []
 
     def _fetch_wsol_pools(self) -> List[Dict]:
-        """Fetch WSOL pools from V3 API using multiple sort strategies.
+        """Fetch WSOL pools from V3 API sorted by fee generation.
 
-        Queries by liquidity and by volume separately, then merges and
-        deduplicates. This surfaces both deep-liquidity pools and
-        high-activity pools that might rank lower by TVL alone.
+        Single query: poolSortField=fee24h, pageSize=1000.
+        This directly surfaces pools generating the most trading fees,
+        which is the only signal that matters for fee farming.
+
+        Filters to V4 AMM pools only (our bridge doesn't support CPMM/CLMM).
         """
-        seen_ids = set()
-        merged = []
+        url = (
+            f"{self.BASE_URL}/pools/info/mint"
+            f"?mint1={WSOL_MINT}"
+            f"&poolType=standard"
+            f"&poolSortField=fee24h"
+            f"&sortType=desc"
+            f"&pageSize=1000"
+            f"&page=1"
+        )
 
-        for sort_field in ('liquidity', 'volume24h'):
-            try:
-                page = 1
-                while True:
-                    url = (
-                        f"{self.BASE_URL}/pools/info/mint"
-                        f"?mint1={WSOL_MINT}"
-                        f"&poolType=standard"
-                        f"&poolSortField={sort_field}"
-                        f"&sortType=desc"
-                        f"&pageSize=100"
-                        f"&page={page}"
-                    )
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        data = response.json()
 
-                    response = requests.get(url, timeout=15)
-                    response.raise_for_status()
-                    data = response.json()
+        pools_data = data.get('data', {})
+        raw_pools = pools_data.get('data', [])
 
-                    pools_data = data.get('data', {})
-                    pools = pools_data.get('data', [])
+        pools = []
+        for pool in raw_pools:
+            if pool.get('programId', '') != RAYDIUM_V4_PROGRAM:
+                continue
+            pools.append(self._normalize_pool(pool))
 
-                    if not pools:
-                        break
-
-                    for pool in pools:
-                        # Only Raydium V4 AMM pools are supported by our bridge.
-                        # CPMM (CPMMoo8L...) and CLMM pools have different layouts.
-                        pool_program = pool.get('programId', '')
-                        if pool_program and pool_program != '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8':
-                            continue
-                        normalized = self._normalize_pool(pool)
-                        pool_id = normalized.get('ammId', '')
-                        if pool_id and pool_id not in seen_ids:
-                            seen_ids.add(pool_id)
-                            merged.append(normalized)
-
-                    if not pools_data.get('hasNextPage', False):
-                        break
-
-                    page += 1
-                    if page > 10:  # 1000 per sort field max
-                        break
-            except Exception as e:
-                print(f"⚠ Error fetching pools sorted by {sort_field}: {e}")
-
-        return merged
+        return pools
 
     def _normalize_pool(self, pool: Dict) -> Dict:
         """
@@ -227,11 +217,21 @@ class RaydiumAPIClient:
         min_liquidity: float = None,
         min_volume_tvl_ratio: float = None,
         min_apr: float = None,
+        min_fee_apr: float = None,
+        max_price_range_ratio: float = None,
+        min_volume_24h: float = None,
+        min_fee_24h: float = None,
+        min_volume_growth: float = None,  # day vs week growth rate
         quote_tokens: List[str] = None,
     ) -> List[Dict]:
         """
-        Get filtered pools based on criteria.
-        V3 API already returns only WSOL pools sorted by liquidity.
+        Get filtered pools based on comprehensive fee farming criteria.
+        
+        Enhanced filters for LP fee farming:
+        - min_fee_apr: Minimum pure fee APR (excludes rewards)
+        - max_price_range_ratio: Maximum 24h price range (IL control)
+        - min_fee_24h: Minimum absolute fees generated
+        - min_volume_growth: Minimum volume acceleration (day/week ratio)
         """
         pools = self.get_all_pools()
         filtered = []
@@ -239,8 +239,15 @@ class RaydiumAPIClient:
         for pool in pools:
             tvl = pool.get('tvl', 0) or pool.get('liquidity', 0)
             day = pool.get('day', {})
+            week = pool.get('week', {})
+            
             apr = day.get('apr', 0) or pool.get('apr24h', 0)
+            fee_apr = day.get('feeApr', 0)
             volume = day.get('volume', 0) or pool.get('volume24h', 0)
+            fee_24h = day.get('volumeFee', 0) or pool.get('fee24h', 0)
+            
+            price_min = day.get('priceMin', 0)
+            price_max = day.get('priceMax', 0)
 
             if tvl <= 0:
                 continue
@@ -255,7 +262,97 @@ class RaydiumAPIClient:
 
             if min_apr and apr < min_apr:
                 continue
+            
+            # Fee APR filter (pure trading fees, not rewards)
+            if min_fee_apr and fee_apr < min_fee_apr:
+                continue
+            
+            # Price range filter (IL control)
+            if max_price_range_ratio and price_min > 0 and price_max > 0:
+                range_ratio = price_max / price_min
+                if range_ratio > max_price_range_ratio:
+                    continue
+            
+            # Minimum volume filter
+            if min_volume_24h and volume < min_volume_24h:
+                continue
+            
+            # Minimum absolute fees filter
+            if min_fee_24h and fee_24h < min_fee_24h:
+                continue
+            
+            # Volume growth filter (momentum)
+            if min_volume_growth:
+                week_vol = week.get('volume', 0)
+                week_avg = week_vol / 7 if week_vol > 0 else 0
+                if week_avg > 0:
+                    growth_rate = volume / week_avg
+                    if growth_rate < min_volume_growth:
+                        continue
+                elif volume == 0:  # No day volume, reject
+                    continue
 
             filtered.append(pool)
 
         return filtered
+
+    # ------------------------------------------------------------------
+    # GeckoTerminal OHLCV — daily candles for multi-period Parkinson σ
+    # ------------------------------------------------------------------
+
+    def get_pool_ohlcv_daily(self, pool_id: str, days: int = 7) -> List[tuple]:
+        """Fetch daily OHLCV candles from GeckoTerminal (free, no API key).
+
+        GeckoTerminal endpoint:
+          GET /api/v2/networks/solana/pools/{pool_id}/ohlcv/day?limit={days}
+        Returns OHLCV list: [[timestamp, open, high, low, close, volume], ...]
+
+        Returns list of (high, low) tuples (newest first).  Empty list on error
+        or if the pool is not found on GeckoTerminal.
+
+        Rate-limited to 30 calls/minute (GeckoTerminal free tier).
+        Results cached for 6 hours — daily candles don't change fast.
+        """
+        # Check cache
+        now = time.time()
+        cache_key = f"{pool_id}_{days}"
+        if cache_key in self._ohlcv_cache:
+            data, ts = self._ohlcv_cache[cache_key]
+            if now - ts < self._ohlcv_cache_ttl:
+                return data
+
+        # Rate limit: 2.1s between calls → ~28 req/min, safely under 30
+        elapsed = now - self._last_gecko_call
+        if elapsed < 2.1:
+            time.sleep(2.1 - elapsed)
+
+        try:
+            url = f"{self.GECKOTERMINAL_BASE}/networks/solana/pools/{pool_id}/ohlcv/day"
+            resp = requests.get(url, params={'limit': days}, timeout=10)
+            self._last_gecko_call = time.time()
+            resp.raise_for_status()
+            ohlcv_list = resp.json().get('data', {}).get('attributes', {}).get('ohlcv_list', [])
+            # Extract (high, low) from each candle: [ts, open, HIGH, LOW, close, vol]
+            candles = []
+            for candle in ohlcv_list:
+                if len(candle) >= 5:
+                    high, low = float(candle[2]), float(candle[3])
+                    if high > 0 and low > 0:
+                        candles.append((high, low))
+            self._ohlcv_cache[cache_key] = (candles, time.time())
+            return candles
+        except Exception:
+            return []
+
+    def enrich_pools_with_candles(self, pools: List[Dict], days: int = 7) -> None:
+        """Fetch daily candles for each pool and add '_daily_candles' key.
+
+        Pools already enriched (from cache) are skipped.
+        Rate limiting is handled by get_pool_ohlcv_daily().
+        """
+        for pool in pools:
+            if '_daily_candles' in pool:
+                continue  # already enriched
+            pool_id = pool.get('id', pool.get('ammId', ''))
+            if pool_id:
+                pool['_daily_candles'] = self.get_pool_ohlcv_daily(pool_id, days)
