@@ -24,6 +24,12 @@ class BotConfig:
     MIN_LIQUIDITY_USD: float = 5_000  # Minimum $5k TVL (lower = riskier but juicier)
     MIN_VOLUME_TVL_RATIO: float = 0.5  # 24h volume should be >50% of TVL
     MIN_APR_24H: float = 100.0  # Minimum 100% APR (demand high yield for the risk)
+    MIN_PREDICTED_NET_APR: float = 30.0  # Min predicted net APR (fees×sust − IL, annualised)
+    MIN_FEE_APR: float = 50.0  # Minimum 50% pure fee APR (excludes rewards)
+    MAX_PRICE_RANGE_RATIO: float = 2.0  # Max 24h price range (2.0 = 100% swing, controls IL)
+    MIN_VOLUME_24H: float = 1_000  # Minimum $1k daily volume
+    MIN_FEE_24H: float = 10.0  # Minimum $10 daily fees generated
+    MIN_VOLUME_GROWTH: float = 0.8  # Min day/week volume ratio (0.8 = 80% of weekly avg)
     MIN_BURN_PERCENT: float = 50.0  # Minimum 50% LP tokens burned (lower = more rug risk)
     REQUIRE_WSOL_PAIRS: bool = True  # Only trade pairs with WSOL
 
@@ -54,9 +60,10 @@ class BotConfig:
     RESERVE_SOL: float = 0.05  # Fixed SOL reserve for tx fees + ATA rent
 
     # Risk Management
-    STOP_LOSS_PERCENT: float = -25.0  # Exit if down 25% (wide for high-risk meme pools)
-    TAKE_PROFIT_PERCENT: float = 20.0  # Exit if up 20% (capture bigger swings)
-    MAX_HOLD_TIME_HOURS: int = 24  # Force exit after 24 hours
+    STOP_LOSS_PERCENT: float = -15.0  # Exit if down 15% (wide for high-risk meme pools)
+    TAKE_PROFIT_PERCENT: float = 10.0  # Exit if up 10% (capture bigger swings)
+    MAX_HOLD_TIME_HOURS: int = 168  # Force exit after 7 days
+    POSITION_REEVAL_INTERVAL_HOURS: int = 24  # Re-evaluate safety every 24 hours
     MAX_IMPERMANENT_LOSS: float = -5.0  # Exit if IL exceeds 5%
     STOP_LOSS_COOLDOWNS: list = None  # Escalating cooldowns per consecutive stop loss [24h, 48h]
     PERMANENT_BLACKLIST_STRIKES: int = 3  # Permanently blacklist after this many consecutive stop losses
