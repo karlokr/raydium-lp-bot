@@ -39,9 +39,10 @@ def _ensure_dir():
 _POS_FIELDS = [
     'amm_id', 'pool_name', 'entry_price_ratio', 'position_size_sol',
     'token_a_amount', 'token_b_amount', 'sol_is_base', 'lp_mint',
-    'lp_token_amount', 'lp_decimals', 'current_price_ratio',
-    'current_il_percent', 'fees_earned_sol', 'unrealized_pnl_sol',
-    'current_lp_value_sol',
+    'lp_token_amount', 'lp_decimals', 'entry_lp_value_sol',
+    'last_reeval_time',
+    'current_price_ratio', 'current_il_percent', 'fees_earned_sol',
+    'unrealized_pnl_sol', 'current_lp_value_sol',
 ]
 
 
@@ -129,6 +130,8 @@ def append_trade_history(position, reason: str, sol_price_usd: float = 0.0):
         'hold_time_hours': round(position.time_held_hours, 2),
         'reason': reason,
         'position_size_sol': position.position_size_sol,
+        'entry_lp_value_sol': round(position.entry_lp_value_sol, 6),
+        'entry_slippage_percent': round(position.entry_slippage_percent, 2),
         'pnl_sol': round(position.unrealized_pnl_sol, 6),
         'pnl_percent': round(position.pnl_percent, 2),
         'fees_earned_sol': round(position.fees_earned_sol, 6),
