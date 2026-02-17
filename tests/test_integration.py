@@ -396,7 +396,7 @@ class TestPoolScoringPipeline:
         )
 
     def test_rank_pools_injects_component_scores(self):
-        """Each ranked pool should have _momentum, _freshness, _il_safety, _velocity."""
+        """Each ranked pool should have the new scoring components."""
         pools = self.client.get_filtered_pools(min_liquidity=5_000)
         if not pools:
             pytest.skip("No pools matched filters")
@@ -404,7 +404,7 @@ class TestPoolScoringPipeline:
         ranked = self.analyzer.rank_pools(pools, top_n=5)
         pool = ranked[0]
 
-        for component in ('_momentum', '_freshness', '_il_safety', '_velocity'):
+        for component in ('_fee_apr', '_fee_consistency', '_depth', '_il_safety'):
             assert component in pool, f"Missing component score '{component}'"
             assert isinstance(pool[component], (int, float))
 
@@ -503,10 +503,9 @@ class TestPoolScoringPipeline:
         if price_min > 0 and price_max > 0 and price_min != price_max:
             from bot.analysis.pool_analyzer import PoolAnalyzer
             il = PoolAnalyzer.calculate_impermanent_loss(price_min, price_max)
-            # IL should be negative (a loss) or zero
-            assert il <= 0, f"IL should be <= 0, got {il}"
-            # IL for real 24h moves should be small (not -50%)
-            assert il > -0.5, f"IL of {il*100:.1f}% seems too extreme for 24h"
+            # Standard IL is always <= 0 and bounded
+            assert il <= 0, f"Standard IL must be <= 0, got {il}"
+            assert abs(il) < 0.5, f"IL of {il*100:.1f}% seems too extreme for 24h"
 
 
 # ── Pool Quality Pipeline (API → RugCheck → Analysis) ───────────────

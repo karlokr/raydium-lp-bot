@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from bot.trading.position_manager import Position, PositionManager, SOL_MINT
+from bot.config import config
 
 
 # ── Position dataclass properties ────────────────────────────────────
@@ -88,35 +89,35 @@ class TestExitConditions:
         return pos
 
     def test_stop_loss(self):
-        pos = self._make_pos(pnl_pct=-30)
+        pos = self._make_pos(pnl_pct=config.STOP_LOSS_PERCENT - 5)
         assert pos.should_exit_sl is True
 
     def test_no_stop_loss(self):
-        pos = self._make_pos(pnl_pct=-10)
+        pos = self._make_pos(pnl_pct=config.STOP_LOSS_PERCENT + 5)
         assert pos.should_exit_sl is False
 
     def test_take_profit(self):
-        pos = self._make_pos(pnl_pct=25)
+        pos = self._make_pos(pnl_pct=config.TAKE_PROFIT_PERCENT + 5)
         assert pos.should_exit_tp is True
 
     def test_no_take_profit(self):
-        pos = self._make_pos(pnl_pct=10)
+        pos = self._make_pos(pnl_pct=config.TAKE_PROFIT_PERCENT - 5)
         assert pos.should_exit_tp is False
 
     def test_max_time(self):
-        pos = self._make_pos(hours=25)
+        pos = self._make_pos(hours=config.MAX_HOLD_TIME_HOURS + 1)
         assert pos.should_exit_time is True
 
     def test_no_max_time(self):
-        pos = self._make_pos(hours=12)
+        pos = self._make_pos(hours=max(1, config.MAX_HOLD_TIME_HOURS - 12))
         assert pos.should_exit_time is False
 
     def test_il_exit(self):
-        pos = self._make_pos(il_pct=-6.0)
+        pos = self._make_pos(il_pct=config.MAX_IMPERMANENT_LOSS - 1.0)
         assert pos.should_exit_il is True
 
     def test_no_il_exit(self):
-        pos = self._make_pos(il_pct=-2.0)
+        pos = self._make_pos(il_pct=config.MAX_IMPERMANENT_LOSS + 3.0)
         assert pos.should_exit_il is False
 
 

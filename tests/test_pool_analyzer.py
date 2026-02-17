@@ -1,6 +1,5 @@
 """Tests for bot/analysis/pool_analyzer.py — scoring, IL, position sizing."""
 import math
-import time
 import pytest
 
 from bot.analysis.pool_analyzer import PoolAnalyzer
@@ -19,128 +18,98 @@ class TestCalculatePoolScore:
         score = analyzer.calculate_pool_score(sample_pool)
         assert score >= 0
 
+    def test_max_score_is_100(self, analyzer):
+        """Score is capped at 100 — no bonus above that."""
+        pool = {
+            "tvl": 10_000,
+            "day": {"feeApr": 10_000, "volume": 50_000, "volumeFee": 2000,
+                    "priceMin": 100, "priceMax": 101},
+            "week": {"volumeFee": 14_000},
+        }
+        score = analyzer.calculate_pool_score(pool)
+        assert score <= 100
+
     def test_high_quality_pool_scores_well(self, analyzer, sample_pool):
         score = analyzer.calculate_pool_score(sample_pool)
         assert score > 40  # decent pool should score above 40
 
     def test_zero_tvl_pool(self, analyzer):
-        pool = {"tvl": 0, "day": {"apr": 0, "volume": 0}, "burnPercent": 0, "week": {}}
+        pool = {"tvl": 0, "day": {"apr": 0, "volume": 0}, "week": {}}
         score = analyzer.calculate_pool_score(pool)
         assert score >= 0
 
-    def test_extreme_apr_maxes_component(self, analyzer):
-        pool = {
-            "tvl": 100_000,
-            "day": {"apr": 10_000, "feeApr": 10_000, "volume": 50_000},
-            "burnPercent": 99,
-            "week": {"volume": 200_000},
-            "openTime": 0,
-        }
-        score = analyzer.calculate_pool_score(pool)
-        # Fee APR component should be capped at 30
-        assert score <= 120  # 30+20+10+15+15+10+10 = theoretical max 110
+    def test_fee_apr_component_capped(self, analyzer):
+        """Fee APR score caps at 50 pts."""
+        components = {}
+        pool = {"tvl": 50_000, "day": {"feeApr": 10_000, "volume": 0}, "week": {}}
+        analyzer.calculate_pool_score(pool, _out=components)
+        assert components['fee_apr'] == 50
 
     def test_feeApr_preferred_over_apr(self, analyzer):
-        pool_with_fee_apr = {
-            "tvl": 50_000,
-            "day": {"apr": 500, "feeApr": 200, "volume": 50_000},
-            "burnPercent": 50,
-            "week": {},
-            "openTime": 0,
-        }
-        pool_without_fee_apr = {
-            "tvl": 50_000,
-            "day": {"apr": 500, "feeApr": 0, "volume": 50_000},
-            "burnPercent": 50,
-            "week": {},
-            "openTime": 0,
-        }
-        score1 = analyzer.calculate_pool_score(pool_with_fee_apr)
-        score2 = analyzer.calculate_pool_score(pool_without_fee_apr)
-        # With feeApr=200 → 30 pts; without → uses apr=500 → also capped at 30.
-        # They may differ due to how feeApr is selected. Verify no crash.
+        pool_with = {"tvl": 50_000, "day": {"apr": 500, "feeApr": 200, "volume": 50_000}, "week": {}}
+        pool_without = {"tvl": 50_000, "day": {"apr": 500, "feeApr": 0, "volume": 50_000}, "week": {}}
+        score1 = analyzer.calculate_pool_score(pool_with)
+        score2 = analyzer.calculate_pool_score(pool_without)
         assert score1 >= 0 and score2 >= 0
 
+    def test_deeper_pool_gets_depth_points(self, analyzer):
+        """A pool with higher TVL should earn more depth points."""
+        deep = {"tvl": 100_000, "day": {"feeApr": 100}, "week": {}}
+        shallow = {"tvl": 5_000, "day": {"feeApr": 100}, "week": {}}
+        out_deep, out_shallow = {}, {}
+        analyzer.calculate_pool_score(deep, _out=out_deep)
+        analyzer.calculate_pool_score(shallow, _out=out_shallow)
+        assert out_deep['depth'] > out_shallow['depth']
 
-class TestCalculateMomentum:
+    def test_components_stashed(self, analyzer, sample_pool):
+        out = {}
+        analyzer.calculate_pool_score(sample_pool, _out=out)
+        assert 'fee_apr' in out
+        assert 'fee_consistency' in out
+        assert 'depth' in out
+        assert 'il_safety' in out
 
-    def test_surging_volume(self, analyzer):
-        day = {"volume": 100_000}
-        week = {"volume": 350_000}  # avg 50k/day, today 100k → 2x
-        score = analyzer._calculate_momentum(day, week, 100_000, 50_000)
+
+class TestFeeConsistency:
+
+    def test_consistent_fees(self, analyzer):
+        day = {"volumeFee": 100}
+        week = {"volumeFee": 700}  # avg 100/day — perfectly consistent
+        score = analyzer._calculate_fee_consistency(day, week, 100)
         assert score == 15.0
 
-    def test_above_average(self, analyzer):
-        day = {"volume": 70_000}
-        week = {"volume": 350_000}  # avg 50k, today 70k → 1.4x
-        score = analyzer._calculate_momentum(day, week, 70_000, 50_000)
-        assert 8.0 <= score <= 15.0
+    def test_moderately_volatile(self, analyzer):
+        day = {"volumeFee": 150}
+        week = {"volumeFee": 700}  # avg 100/day, today 1.5x
+        score = analyzer._calculate_fee_consistency(day, week, 150)
+        assert 3.0 < score < 15.0
 
-    def test_declining_volume(self, analyzer):
-        day = {"volume": 10_000}
-        week = {"volume": 350_000}  # avg 50k, today 10k → 0.2x
-        score = analyzer._calculate_momentum(day, week, 10_000, 50_000)
-        assert score < 3.0
+    def test_highly_volatile(self, analyzer):
+        day = {"volumeFee": 500}
+        week = {"volumeFee": 700}  # avg 100/day, today 5x
+        score = analyzer._calculate_fee_consistency(day, week, 500)
+        assert score == 3.0
 
-    def test_no_week_data(self, analyzer):
-        day = {"volume": 50_000}
-        week = {"volume": 0}
-        score = analyzer._calculate_momentum(day, week, 50_000, 50_000)
+    def test_new_pool_no_week_data(self, analyzer):
+        day = {"volumeFee": 100}
+        week = {"volumeFee": 0}
+        score = analyzer._calculate_fee_consistency(day, week, 100)
         assert score == 7.0
 
-    def test_zero_everything(self, analyzer):
-        score = analyzer._calculate_momentum({}, {}, 0, 0)
+    def test_no_fees(self, analyzer):
+        score = analyzer._calculate_fee_consistency({}, {}, 0)
         assert score == 0.0
-
-
-class TestCalculateFreshness:
-
-    def test_opentime_zero_neutral(self, analyzer):
-        pool = {"openTime": 0}
-        assert analyzer._calculate_freshness(pool, 50) == 4.0
-
-    def test_very_new_high_base_score(self, analyzer):
-        pool = {"openTime": int(time.time()) - 1800}  # 30 min ago
-        assert analyzer._calculate_freshness(pool, 50) == 10.0
-
-    def test_very_new_low_base_score(self, analyzer):
-        pool = {"openTime": int(time.time()) - 1800}
-        assert analyzer._calculate_freshness(pool, 20) == 3.0
-
-    def test_one_to_three_days(self, analyzer):
-        pool = {"openTime": int(time.time()) - 86400 * 2}  # 2 days
-        assert analyzer._calculate_freshness(pool, 50) == 8.0
-
-    def test_three_to_seven_days(self, analyzer):
-        pool = {"openTime": int(time.time()) - 86400 * 5}
-        assert analyzer._calculate_freshness(pool, 50) == 5.0
-
-    def test_seven_to_fourteen_days(self, analyzer):
-        pool = {"openTime": int(time.time()) - 86400 * 10}
-        assert analyzer._calculate_freshness(pool, 50) == 2.0
-
-    def test_older_than_fourteen_days(self, analyzer):
-        pool = {"openTime": int(time.time()) - 86400 * 30}
-        assert analyzer._calculate_freshness(pool, 50) == 0.0
-
-    def test_invalid_opentime_string(self, analyzer):
-        pool = {"openTime": "bad"}
-        assert analyzer._calculate_freshness(pool, 50) == 4.0
-
-    def test_future_opentime(self, analyzer):
-        pool = {"openTime": int(time.time()) + 86400}
-        assert analyzer._calculate_freshness(pool, 50) == 0.0
 
 
 class TestEstimateIlSafety:
 
     def test_tight_range(self, analyzer):
         pool = {"day": {"priceMin": 100, "priceMax": 104}}  # 4% range
-        assert analyzer._estimate_il_safety(pool) == 15.0
+        assert analyzer._estimate_il_safety(pool) == 25.0
 
     def test_moderate_range(self, analyzer):
-        pool = {"day": {"priceMin": 100, "priceMax": 115}}  # 15% range
-        assert analyzer._estimate_il_safety(pool) == 9.0
+        pool = {"day": {"priceMin": 100, "priceMax": 112}}  # 12% range
+        assert analyzer._estimate_il_safety(pool) == 16.0
 
     def test_wide_range(self, analyzer):
         pool = {"day": {"priceMin": 100, "priceMax": 180}}  # 80% range
@@ -153,24 +122,24 @@ class TestEstimateIlSafety:
     def test_no_price_data_fallback(self, analyzer):
         pool = {"day": {}, "name": "BONK/WSOL"}
         score = analyzer._estimate_il_safety(pool)
-        assert score == 5.0  # unknown meme pair default
+        assert score == 6.0  # unknown meme pair default
 
     def test_stablecoin_fallback(self, analyzer):
         pool = {"day": {}, "name": "USDC/USDT"}
-        assert analyzer._estimate_il_safety(pool) == 15.0
+        assert analyzer._estimate_il_safety(pool) == 25.0
 
     def test_sol_usdc_fallback(self, analyzer):
         pool = {"day": {}, "name": "WSOL/USDC"}
-        assert analyzer._estimate_il_safety(pool) == 9.0
+        assert analyzer._estimate_il_safety(pool) == 15.0
 
 
 class TestRankPools:
 
     def test_returns_top_n(self, analyzer):
         pools = [
-            {"tvl": 10_000, "day": {"apr": 50, "volume": 5000}, "burnPercent": 50, "week": {}, "openTime": 0},
-            {"tvl": 50_000, "day": {"apr": 200, "volume": 100000}, "burnPercent": 99, "week": {"volume": 500000}, "openTime": 0},
-            {"tvl": 30_000, "day": {"apr": 100, "volume": 30000}, "burnPercent": 80, "week": {"volume": 200000}, "openTime": 0},
+            {"tvl": 10_000, "day": {"apr": 50, "volume": 5000}, "week": {}},
+            {"tvl": 50_000, "day": {"apr": 200, "volume": 100000}, "week": {"volume": 500000}},
+            {"tvl": 30_000, "day": {"apr": 100, "volume": 30000}, "week": {"volume": 200000}},
         ]
         ranked = analyzer.rank_pools(pools, top_n=2)
         assert len(ranked) == 2
@@ -178,10 +147,10 @@ class TestRankPools:
 
     def test_injects_component_scores(self, analyzer, sample_pool):
         ranked = analyzer.rank_pools([sample_pool], top_n=1)
-        assert "_momentum" in ranked[0]
-        assert "_freshness" in ranked[0]
+        assert "_fee_apr" in ranked[0]
+        assert "_fee_consistency" in ranked[0]
+        assert "_depth" in ranked[0]
         assert "_il_safety" in ranked[0]
-        assert "_velocity" in ranked[0]
 
 
 # ── calculate_position_size ──────────────────────────────────────────
@@ -227,18 +196,21 @@ class TestCalculateImpermanentLoss:
 
     def test_2x_price_increase(self):
         il = PoolAnalyzer.calculate_impermanent_loss(100, 200)
-        expected = 2 * math.sqrt(2) / (1 + 2) - 1
+        # Standard formula: 2*sqrt(2)/3 - 1 ≈ -0.05719
+        expected = 2 * math.sqrt(2.0) / (1 + 2.0) - 1
         assert il == pytest.approx(expected, abs=1e-6)
 
     def test_half_price_decrease(self):
         il = PoolAnalyzer.calculate_impermanent_loss(100, 50)
+        # Standard formula: 2*sqrt(0.5)/1.5 - 1 ≈ -0.05719
         expected = 2 * math.sqrt(0.5) / (1 + 0.5) - 1
         assert il == pytest.approx(expected, abs=1e-6)
 
     def test_il_always_negative(self):
+        """Standard IL is always <= 0: LP always underperforms HODL (ignoring fees)."""
         for ratio in [0.1, 0.5, 2.0, 5.0, 10.0]:
-            il = PoolAnalyzer.calculate_impermanent_loss(1.0, ratio)
-            assert il <= 0
+            il = PoolAnalyzer.calculate_impermanent_loss(100, 100 * ratio)
+            assert il <= 1e-9, f"IL should be <= 0 for r={ratio}, got {il}"
 
     def test_zero_entry_price(self):
         assert PoolAnalyzer.calculate_impermanent_loss(0, 100) == 0.0
@@ -246,8 +218,10 @@ class TestCalculateImpermanentLoss:
     def test_zero_current_price(self):
         assert PoolAnalyzer.calculate_impermanent_loss(100, 0) == 0.0
 
-    def test_symmetry_of_magnitude(self):
-        """IL(2x) should equal IL(0.5x) in magnitude."""
-        il_up = PoolAnalyzer.calculate_impermanent_loss(100, 200)
-        il_down = PoolAnalyzer.calculate_impermanent_loss(100, 50)
-        assert abs(il_up) == pytest.approx(abs(il_down), abs=1e-6)
+    def test_il_symmetry(self):
+        """Standard IL is symmetric: IL(2x) == IL(0.5x)."""
+        il_up = PoolAnalyzer.calculate_impermanent_loss(100, 200)    # r=2
+        il_down = PoolAnalyzer.calculate_impermanent_loss(100, 50)   # r=0.5
+        assert il_up == pytest.approx(il_down, abs=1e-9)
+        # Both should be ≈ -5.72%
+        assert il_up == pytest.approx(-0.05719, abs=1e-4)

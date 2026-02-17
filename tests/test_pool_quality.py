@@ -58,8 +58,9 @@ class TestAnalyzePoolBasicChecks:
         assert any("LP burn" in r for r in result["risks"])
 
     def test_extreme_apr_rejected(self, analyzer, sample_pool):
-        sample_pool["day"]["apr"] = 2000
+        sample_pool["day"]["apr"] = 2100  # Above 2000 threshold
         analyzer.rugcheck.analyze_token_safety.return_value = _safe_rugcheck()
+        analyzer.lp_lock.analyze_lp_lock.return_value = _safe_lp_lock()
         result = analyzer.analyze_pool(sample_pool)
         assert any("Extreme APR" in r for r in result["risks"])
 
@@ -131,8 +132,9 @@ class TestAnalyzePoolRugCheck:
 
     def test_whale_holder(self, analyzer, sample_pool):
         rc = _safe_rugcheck()
-        rc["max_single_holder_pct"] = 20
+        rc["max_single_holder_pct"] = 30  # Above 25% threshold
         analyzer.rugcheck.analyze_token_safety.return_value = rc
+        analyzer.lp_lock.analyze_lp_lock.return_value = _safe_lp_lock()
         result = analyzer.analyze_pool(sample_pool)
         assert result["is_safe"] is False
 
